@@ -1,0 +1,23 @@
+import os
+
+
+class Settings:
+    def __init__(self) -> None:
+        self.env = os.getenv("APP_ENV", "local")
+
+        if self.env == "server":
+            self.host = os.getenv("APP_HOST", "0.0.0.0")
+            self.port = int(os.getenv("APP_PORT", "8000"))
+            self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+            self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3")
+        else:
+            self.host = os.getenv("APP_HOST", "127.0.0.1")
+            self.port = int(os.getenv("APP_PORT", "8000"))
+            self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+            self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3")
+
+        self.chroma_path = os.getenv("CHROMA_PATH", "./chromaDB")
+        self.mcp_base_url = os.getenv("MCP_BASE_URL", "http://api.strangeway.life")
+
+
+settings = Settings()
