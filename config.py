@@ -18,6 +18,8 @@ class Settings:
 
         self.chroma_path = os.getenv("CHROMA_PATH", "./chromaDB")
         self.mcp_base_url = os.getenv("MCP_BASE_URL", "http://api.strangeway.life")
+        self.ollama_keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "24h")
+        self.ollama_timeout_seconds = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
 
 
 settings = Settings()

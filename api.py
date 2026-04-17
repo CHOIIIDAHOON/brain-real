@@ -31,6 +31,7 @@ class ChatRequest(BaseModel):
     message: str
     model: Optional[str] = None
     think: Optional[bool] = None
+    keep_alive: Optional[str] = None
 
 
 class ChromaAddRequest(BaseModel):
@@ -54,6 +55,9 @@ def chat(req: ChatRequest) -> Dict[str, Any]:
     }
     if req.think is not None:
         payload["think"] = req.think
+    keep_alive = req.keep_alive or settings.ollama_keep_alive
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
 
     try:
         req_obj = request.Request(
@@ -62,7 +66,7 @@ def chat(req: ChatRequest) -> Dict[str, Any]:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with request.urlopen(req_obj, timeout=60) as response:
+        with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
             body = json.loads(response.read().decode("utf-8"))
         return {"answer": body.get("response", ""), "model": payload["model"]}
     except error.URLError as ex:
