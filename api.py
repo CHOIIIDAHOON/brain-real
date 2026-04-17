@@ -34,6 +34,7 @@ class ChatRequest(BaseModel):
     think: Optional[bool] = None
     keep_alive: Optional[str] = None
     stream: bool = False
+    system_prompt: Optional[str] = None
 
 
 class ChromaAddRequest(BaseModel):
@@ -79,6 +80,9 @@ def chat(req: ChatRequest) -> Any:
         "prompt": req.message,
         "stream": req.stream,
     }
+    system_prompt = req.system_prompt or settings.default_system_prompt
+    if system_prompt:
+        payload["system"] = system_prompt
     if req.think is not None:
         payload["think"] = req.think
     keep_alive = req.keep_alive or settings.ollama_keep_alive

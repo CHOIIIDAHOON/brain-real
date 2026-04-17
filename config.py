@@ -29,6 +29,16 @@ class Settings:
             "CORS_ALLOW_ORIGIN_REGEX",
             r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
         )
+        self.default_system_prompt = os.getenv(
+            "DEFAULT_SYSTEM_PROMPT",
+            (
+                "응답 길이 규칙:\n"
+                "- 기본은 3줄 이내, 명령어/결론 우선.\n"
+                '- 사용자가 "자세히", "왜", "설명", "가이드", "단계별"을 요청한 경우에만 상세 설명 허용.\n'
+                "- 에러/장애 해결 상황에서는 원인 1줄 + 조치 명령어만 먼저 제시.\n"
+                "- 추가 설명은 사용자가 요청할 때만 제공."
+            ),
+        )
 
 
 settings = Settings()
