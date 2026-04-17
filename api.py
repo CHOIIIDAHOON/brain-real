@@ -1,9 +1,10 @@
 import json
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 from urllib import error, request
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import settings
@@ -32,6 +33,7 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
     think: Optional[bool] = None
     keep_alive: Optional[str] = None
+    stream: bool = False
 
 
 class ChromaAddRequest(BaseModel):
@@ -45,19 +47,45 @@ class ChromaSearchRequest(BaseModel):
     n_results: int = Field(default=3, ge=1, le=20)
 
 
+def _chat_stream(url: str, payload: Dict[str, Any]) -> Iterator[str]:
+    req_obj = request.Request(
+        url=url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                piece = data.get("response", "")
+                for ch in piece:
+                    yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
+                if data.get("done"):
+                    yield "event: done\ndata: [DONE]\n\n"
+                    break
+    except Exception as ex:
+        yield f"event: error\ndata: {json.dumps({'error': str(ex)}, ensure_ascii=False)}\n\n"
+
+
 @chat_router.post("/chat")
-def chat(req: ChatRequest) -> Dict[str, Any]:
+def chat(req: ChatRequest) -> Any:
     url = f"{settings.ollama_base_url}/api/generate"
     payload = {
         "model": req.model or settings.ollama_model,
         "prompt": req.message,
-        "stream": False,
+        "stream": req.stream,
     }
     if req.think is not None:
         payload["think"] = req.think
     keep_alive = req.keep_alive or settings.ollama_keep_alive
     if keep_alive:
         payload["keep_alive"] = keep_alive
+    if req.stream:
+        return StreamingResponse(_chat_stream(url, payload), media_type="text/event-stream")
 
     try:
         req_obj = request.Request(
