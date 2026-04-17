@@ -25,6 +25,10 @@ class Settings:
             "http://localhost:3000,http://localhost:5000,http://localhost:8000,http://127.0.0.1:3000,http://127.0.0.1:5000,http://127.0.0.1:8000",
         )
         self.cors_allow_origins = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
+        self.cors_allow_origin_regex = os.getenv(
+            "CORS_ALLOW_ORIGIN_REGEX",
+            r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        )
 
 
 settings = Settings()
