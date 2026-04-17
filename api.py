@@ -3,7 +3,7 @@ import uuid
 from typing import Any, Dict, Iterator, List, Optional
 from urllib import error, request
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -18,6 +18,11 @@ mcp_router = APIRouter(prefix="/mcp", tags=["mcp"])
 
 _chroma_collection = None
 _memory_store: List[Dict[str, Any]] = []
+_stream_headers = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
 
 try:
     import chromadb  # type: ignore
@@ -61,7 +66,10 @@ def _chat_stream(url: str, payload: Dict[str, Any]) -> Iterator[str]:
                 line = raw_line.decode("utf-8").strip()
                 if not line:
                     continue
-                data = json.loads(line)
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 piece = data.get("response", "")
                 for ch in piece:
                     yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
@@ -72,8 +80,16 @@ def _chat_stream(url: str, payload: Dict[str, Any]) -> Iterator[str]:
         yield f"event: error\ndata: {json.dumps({'error': str(ex)}, ensure_ascii=False)}\n\n"
 
 
+def _client_meta(req: Request) -> Dict[str, str]:
+    return {
+        "client": req.headers.get("x-dabo-client", "unknown"),
+        "build": req.headers.get("x-dabo-build", "unknown"),
+        "api_version": req.headers.get("x-api-version", "unknown"),
+    }
+
+
 @chat_router.post("/chat")
-def chat(req: ChatRequest) -> Any:
+def chat(req: ChatRequest, request_info: Request) -> Any:
     url = f"{settings.ollama_base_url}/api/generate"
     payload = {
         "model": req.model or settings.ollama_model,
@@ -88,8 +104,18 @@ def chat(req: ChatRequest) -> Any:
     keep_alive = req.keep_alive or settings.ollama_keep_alive
     if keep_alive:
         payload["keep_alive"] = keep_alive
+    client = _client_meta(request_info)
     if req.stream:
-        return StreamingResponse(_chat_stream(url, payload), media_type="text/event-stream")
+        return StreamingResponse(
+            _chat_stream(url, payload),
+            media_type="text/event-stream; charset=utf-8",
+            headers={
+                **_stream_headers,
+                "X-DABO-Client": client["client"],
+                "X-DABO-Build": client["build"],
+                "X-API-Version": client["api_version"],
+            },
+        )
 
     try:
         req_obj = request.Request(
@@ -100,7 +126,11 @@ def chat(req: ChatRequest) -> Any:
         )
         with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
             body = json.loads(response.read().decode("utf-8"))
-        return {"answer": body.get("response", ""), "model": payload["model"]}
+        return {
+            "answer": body.get("response", ""),
+            "model": payload["model"],
+            "client": client,
+        }
     except error.URLError as ex:
         raise HTTPException(status_code=502, detail=f"Ollama connection failed: {ex}") from ex
     except Exception as ex:
