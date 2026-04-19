@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api import chat_router, chroma_router, mcp_router
 from config import settings
+from hermes import hermes_router
 
 
 app = FastAPI(title="Personal Assistant AI API")
@@ -17,6 +18,7 @@ app.add_middleware(
 app.include_router(chat_router)
 app.include_router(chroma_router)
 app.include_router(mcp_router)
+app.include_router(hermes_router)
 
 
 @app.get("/")

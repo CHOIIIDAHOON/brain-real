@@ -1,6 +1,6 @@
 import json
 import uuid
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 from urllib import error, request
 
 from fastapi import APIRouter, HTTPException, Request
@@ -18,6 +18,8 @@ mcp_router = APIRouter(prefix="/mcp", tags=["mcp"])
 
 _chroma_collection = None
 _memory_store: List[Dict[str, Any]] = []
+_chat_sessions: Dict[str, List[Dict[str, str]]] = {}
+_max_session_turns = 20
 _stream_headers = {
     "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
@@ -40,6 +42,8 @@ class ChatRequest(BaseModel):
     keep_alive: Optional[str] = None
     stream: bool = False
     system_prompt: Optional[str] = None
+    session_id: Optional[str] = None
+    new_chat: bool = False
 
 
 class ChromaAddRequest(BaseModel):
@@ -53,13 +57,28 @@ class ChromaSearchRequest(BaseModel):
     n_results: int = Field(default=3, ge=1, le=20)
 
 
-def _chat_stream(url: str, payload: Dict[str, Any]) -> Iterator[str]:
+def _build_session_prompt(history: List[Dict[str, str]], current_message: str) -> str:
+    lines: List[str] = []
+    for item in history:
+        role = item.get("role", "user").upper()
+        content = item.get("content", "")
+        if content:
+            lines.append(f"{role}: {content}")
+    lines.append(f"USER: {current_message}")
+    lines.append("ASSISTANT:")
+    return "\n".join(lines)
+
+
+def _chat_stream(
+    url: str, payload: Dict[str, Any], on_complete: Optional[Callable[[str], None]] = None
+) -> Iterator[str]:
     req_obj = request.Request(
         url=url,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    answer_parts: List[str] = []
     try:
         with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
             for raw_line in response:
@@ -71,9 +90,12 @@ def _chat_stream(url: str, payload: Dict[str, Any]) -> Iterator[str]:
                 except json.JSONDecodeError:
                     continue
                 piece = data.get("response", "")
+                answer_parts.append(piece)
                 for ch in piece:
                     yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
                 if data.get("done"):
+                    if on_complete:
+                        on_complete("".join(answer_parts))
                     yield "event: done\ndata: [DONE]\n\n"
                     break
     except Exception as ex:
@@ -90,10 +112,16 @@ def _client_meta(req: Request) -> Dict[str, str]:
 
 @chat_router.post("/chat")
 def chat(req: ChatRequest, request_info: Request) -> Any:
+    session_id = req.session_id or str(uuid.uuid4())
+    if req.new_chat:
+        _chat_sessions.pop(session_id, None)
+    history = _chat_sessions.get(session_id, [])
+    prompt = _build_session_prompt(history, req.message)
+
     url = f"{settings.ollama_base_url}/api/generate"
     payload = {
         "model": req.model or settings.ollama_model,
-        "prompt": req.message,
+        "prompt": prompt,
         "stream": req.stream,
     }
     system_prompt = req.system_prompt or settings.default_system_prompt
@@ -105,15 +133,24 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
     if keep_alive:
         payload["keep_alive"] = keep_alive
     client = _client_meta(request_info)
+
+    def _save_turn(answer: str) -> None:
+        turns = _chat_sessions.setdefault(session_id, [])
+        turns.append({"role": "user", "content": req.message})
+        turns.append({"role": "assistant", "content": answer})
+        if len(turns) > _max_session_turns * 2:
+            _chat_sessions[session_id] = turns[-(_max_session_turns * 2) :]
+
     if req.stream:
         return StreamingResponse(
-            _chat_stream(url, payload),
+            _chat_stream(url, payload, on_complete=_save_turn),
             media_type="text/event-stream; charset=utf-8",
             headers={
                 **_stream_headers,
                 "X-DABO-Client": client["client"],
                 "X-DABO-Build": client["build"],
                 "X-API-Version": client["api_version"],
+                "X-Session-Id": session_id,
             },
         )
 
@@ -126,10 +163,13 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         )
         with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
             body = json.loads(response.read().decode("utf-8"))
+        answer = body.get("response", "")
+        _save_turn(answer)
         return {
-            "answer": body.get("response", ""),
+            "answer": answer,
             "model": payload["model"],
             "client": client,
+            "session_id": session_id,
         }
     except error.URLError as ex:
         raise HTTPException(status_code=502, detail=f"Ollama connection failed: {ex}") from ex
