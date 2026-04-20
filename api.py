@@ -477,7 +477,10 @@ def _decide_memory_with_ollama(
         method="POST",
     )
     started_at = perf_counter()
-    with request.urlopen(req_obj, timeout=settings.chat_memory_decision_timeout_seconds) as response:
+    decision_timeout_seconds = settings.chat_memory_decision_timeout_seconds
+    if decision_timeout_seconds <= 0:
+        decision_timeout_seconds = settings.ollama_timeout_seconds
+    with request.urlopen(req_obj, timeout=decision_timeout_seconds) as response:
         body = json.loads(response.read().decode("utf-8"))
     latency_ms = int((perf_counter() - started_at) * 1000)
     text = str(body.get("response", "")).strip()
@@ -518,6 +521,7 @@ def _decide_memory_with_ollama(
             },
             "session_id": session_id,
             "flow_id": flow_id,
+            "timeout_seconds": decision_timeout_seconds,
         },
     )
     return result
