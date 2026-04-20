@@ -93,15 +93,47 @@ def _write_chat_log(event: str, payload: Dict[str, Any]) -> None:
         return
 
 
-def _fetch_hermes_memory(limit: int, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def _normalize_keep_alive_for_log(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.endswith("h") and text[:-1].isdigit():
+        return text[:-1]
+    return text
+
+
+def _log_prompt_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "prompt": str(payload.get("prompt", "")),
+        "stream": bool(payload.get("stream", False)),
+        "system": str(payload.get("system", "")),
+        "keep_alive": _normalize_keep_alive_for_log(payload.get("keep_alive")),
+    }
+
+
+def _log_chat_flow(session_id: str, flow_id: str, step: str, data: Optional[Dict[str, Any]] = None) -> None:
+    _write_chat_log(
+        "chat_flow",
+        {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "step": step,
+            "data": data or {},
+        },
+    )
+
+
+def _fetch_hermes_memory(
+    limit: int, session_id: Optional[str] = None, flow_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
     _write_chat_log(
         "hermes_memory_query_request",
-        {"limit": limit, "session_id": session_id},
+        {"limit": limit, "session_id": session_id, "flow_id": flow_id},
     )
     rows = hermes_service.list_memory(limit=limit)
     _write_chat_log(
         "hermes_memory_query_response",
-        {"limit": limit, "count": len(rows), "session_id": session_id},
+        {"limit": limit, "count": len(rows), "session_id": session_id, "flow_id": flow_id},
     )
     return rows
 
@@ -113,6 +145,7 @@ def _save_hermes_memory(
     source: str,
     session_id: str,
     user_message: str,
+    flow_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     _write_chat_log(
         "hermes_memory_add_request",
@@ -122,6 +155,7 @@ def _save_hermes_memory(
             "tags": tags,
             "source": source,
             "session_id": session_id,
+            "flow_id": flow_id,
         },
     )
     row = hermes_service.add_memory(
@@ -134,14 +168,23 @@ def _save_hermes_memory(
     )
     _write_chat_log(
         "hermes_memory_add_response",
-        {"memory_id": row.get("memory_id"), "title": row.get("title"), "session_id": session_id},
+        {
+            "memory_id": row.get("memory_id"),
+            "title": row.get("title"),
+            "session_id": session_id,
+            "flow_id": flow_id,
+        },
     )
     return row
 
 
-def _build_memory_context() -> str:
-    rows = _fetch_hermes_memory(limit=settings.chat_first_scan_results)
+def _build_memory_context(session_id: Optional[str] = None, flow_id: Optional[str] = None) -> str:
+    rows = _fetch_hermes_memory(limit=settings.chat_first_scan_results, session_id=session_id, flow_id=flow_id)
     if not rows:
+        _write_chat_log(
+            "hermes_context_built",
+            {"session_id": session_id, "flow_id": flow_id, "applied": False, "count": 0},
+        )
         return ""
 
     lines = ["[HERMES_GLOBAL_MEMORY_CONTEXT]"]
@@ -153,8 +196,16 @@ def _build_memory_context() -> str:
         prefix = f"{idx}. {title} - " if title else f"{idx}. "
         lines.append(f"{prefix}{content}")
     if len(lines) == 1:
+        _write_chat_log(
+            "hermes_context_built",
+            {"session_id": session_id, "flow_id": flow_id, "applied": False, "count": 0},
+        )
         return ""
     lines.append("[END_HERMES_GLOBAL_MEMORY_CONTEXT]")
+    _write_chat_log(
+        "hermes_context_built",
+        {"session_id": session_id, "flow_id": flow_id, "applied": True, "count": max(len(lines) - 2, 0)},
+    )
     return "\n".join(lines)
 
 
@@ -182,11 +233,11 @@ def _extract_json_object(raw_text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _is_duplicate_memory(text: str) -> bool:
+def _is_duplicate_memory(text: str, session_id: Optional[str] = None, flow_id: Optional[str] = None) -> bool:
     lowered = text.strip().lower()
     if not lowered:
         return True
-    existing = _fetch_hermes_memory(limit=100)
+    existing = _fetch_hermes_memory(limit=100, session_id=session_id, flow_id=flow_id)
     for row in existing:
         existing_content = str(row.get("content", "")).strip().lower()
         if existing_content and (existing_content in lowered or lowered in existing_content):
@@ -194,7 +245,13 @@ def _is_duplicate_memory(text: str) -> bool:
     return False
 
 
-def _decide_memory_with_ollama(model: str, user_message: str, answer: str) -> Dict[str, Any]:
+def _decide_memory_with_ollama(
+    model: str,
+    user_message: str,
+    answer: str,
+    session_id: Optional[str] = None,
+    flow_id: Optional[str] = None,
+) -> Dict[str, Any]:
     decision_prompt = (
         "You are a memory gate for a chat assistant.\n"
         "Decide whether this turn should be saved to long-term global memory.\n"
@@ -225,6 +282,8 @@ def _decide_memory_with_ollama(model: str, user_message: str, answer: str) -> Di
             "url": url,
             "payload": payload,
             "user_message": user_message,
+            "session_id": session_id,
+            "flow_id": flow_id,
         },
     )
     req_obj = request.Request(
@@ -261,47 +320,87 @@ def _decide_memory_with_ollama(model: str, user_message: str, answer: str) -> Di
             "model": model,
             "raw_response": text,
             "parsed": result,
+            "session_id": session_id,
+            "flow_id": flow_id,
         },
     )
     return result
 
 
-def _maybe_store_global_memory(session_id: str, user_message: str, answer: str, model: str) -> None:
+def _maybe_store_global_memory(
+    session_id: str,
+    user_message: str,
+    answer: str,
+    model: str,
+    flow_id: Optional[str] = None,
+) -> None:
     if settings.chat_memory_decision_mode.lower() != "ollama":
         _write_chat_log(
             "memory_store_skip",
-            {"session_id": session_id, "reason": "decision_mode_off", "mode": settings.chat_memory_decision_mode},
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "reason": "decision_mode_off",
+                "mode": settings.chat_memory_decision_mode,
+            },
         )
         return
     if not answer.strip():
-        _write_chat_log("memory_store_skip", {"session_id": session_id, "reason": "empty_answer"})
+        _write_chat_log(
+            "memory_store_skip",
+            {"session_id": session_id, "flow_id": flow_id, "reason": "empty_answer"},
+        )
         return
 
     try:
-        decision = _decide_memory_with_ollama(model=model, user_message=user_message, answer=answer)
+        _log_chat_flow(
+            session_id,
+            flow_id or "n/a",
+            "memory_decision_started",
+            {"model": model},
+        )
+        decision = _decide_memory_with_ollama(
+            model=model,
+            user_message=user_message,
+            answer=answer,
+            session_id=session_id,
+            flow_id=flow_id,
+        )
     except Exception as ex:
         _write_chat_log(
             "memory_store_skip",
-            {"session_id": session_id, "reason": "decision_error", "error": str(ex)},
+            {"session_id": session_id, "flow_id": flow_id, "reason": "decision_error", "error": str(ex)},
         )
         return
+    _log_chat_flow(
+        session_id,
+        flow_id or "n/a",
+        "memory_decision_completed",
+        {"action": decision.get("action", "skip")},
+    )
 
     if decision["action"] != "add":
         _write_chat_log(
             "memory_store_skip",
-            {"session_id": session_id, "reason": "decision_skip", "decision": decision},
+            {"session_id": session_id, "flow_id": flow_id, "reason": "decision_skip", "decision": decision},
         )
         return
 
     content = decision["content"] or f"{user_message}\n{answer}"
-    if _is_duplicate_memory(content):
+    if _is_duplicate_memory(content, session_id=session_id, flow_id=flow_id):
         _write_chat_log(
             "memory_store_skip",
-            {"session_id": session_id, "reason": "duplicate", "content_preview": content[:200]},
+            {"session_id": session_id, "flow_id": flow_id, "reason": "duplicate", "content_preview": content[:200]},
         )
         return
 
     title = decision["title"] or user_message.strip().replace("\n", " ")[:50] or "chat_memory"
+    _log_chat_flow(
+        session_id,
+        flow_id or "n/a",
+        "memory_save_started",
+        {"title": title},
+    )
     row = _save_hermes_memory(
         title=title,
         content=content,
@@ -309,17 +408,36 @@ def _maybe_store_global_memory(session_id: str, user_message: str, answer: str, 
         source="chat_auto",
         session_id=session_id,
         user_message=user_message,
+        flow_id=flow_id,
     )
     _write_chat_log(
         "memory_store_add",
-        {"session_id": session_id, "decision": decision, "memory_id": row.get("memory_id"), "title": title},
+        {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "decision": decision,
+            "memory_id": row.get("memory_id"),
+            "title": title,
+        },
+    )
+    _log_chat_flow(
+        session_id,
+        flow_id or "n/a",
+        "memory_save_completed",
+        {"memory_id": row.get("memory_id")},
     )
 
 
-def _schedule_memory_store(session_id: str, user_message: str, answer: str, model: str) -> None:
+def _schedule_memory_store(
+    session_id: str,
+    user_message: str,
+    answer: str,
+    model: str,
+    flow_id: Optional[str] = None,
+) -> None:
     _write_chat_log(
         "memory_store_scheduled",
-        {"session_id": session_id, "model": model, "user_message": user_message},
+        {"session_id": session_id, "flow_id": flow_id, "model": model, "user_message": user_message},
     )
     worker = threading.Thread(
         target=_maybe_store_global_memory,
@@ -328,6 +446,7 @@ def _schedule_memory_store(session_id: str, user_message: str, answer: str, mode
             "user_message": user_message,
             "answer": answer,
             "model": model,
+            "flow_id": flow_id,
         },
         daemon=True,
     )
@@ -359,13 +478,15 @@ def _chat_stream(
     on_complete: Optional[Callable[[str], None]] = None,
     log_context: Optional[Dict[str, Any]] = None,
 ) -> Iterator[str]:
+    flow_id = str((log_context or {}).get("flow_id", "n/a"))
+    session_id = str((log_context or {}).get("session_id", "n/a"))
+    _log_chat_flow(session_id, flow_id, "llm_request_started", {"stream": True})
     _write_chat_log(
         "chat_http_request",
         {
             **(log_context or {}),
             "url": url,
-            "payload": payload,
-            "stream": True,
+            **_log_prompt_fields(payload),
         },
     )
     req_obj = request.Request(
@@ -402,6 +523,7 @@ def _chat_stream(
                             "answer": _normalize_answer_text(final_answer),
                         },
                     )
+                    _log_chat_flow(session_id, flow_id, "llm_response_completed", {"stream": True})
                     yield "event: done\ndata: [DONE]\n\n"
                     done_sent = True
                     break
@@ -417,6 +539,12 @@ def _chat_stream(
                         "answer": _normalize_answer_text(final_answer),
                     },
                 )
+                _log_chat_flow(
+                    session_id,
+                    flow_id,
+                    "llm_response_completed",
+                    {"stream": True, "fallback": "upstream_closed_without_done"},
+                )
                 yield "event: done\ndata: [DONE]\n\n"
                 done_sent = True
     except Exception as ex:
@@ -424,12 +552,19 @@ def _chat_stream(
             "chat_http_error",
             {**(log_context or {}), "stream": True, "error": str(ex)},
         )
+        _log_chat_flow(session_id, flow_id, "llm_response_error", {"stream": True, "error": str(ex)})
         yield f"event: error\ndata: {json.dumps({'error': str(ex)}, ensure_ascii=False)}\n\n"
     finally:
         if not done_sent:
             _write_chat_log(
                 "chat_stream_done_fallback",
                 {**(log_context or {}), "reason": "finally_guard"},
+            )
+            _log_chat_flow(
+                session_id,
+                flow_id,
+                "llm_response_completed",
+                {"stream": True, "fallback": "finally_guard"},
             )
             yield "event: done\ndata: [DONE]\n\n"
 
@@ -445,14 +580,42 @@ def _client_meta(req: Request) -> Dict[str, str]:
 @chat_router.post("/chat")
 def chat(req: ChatRequest, request_info: Request) -> Any:
     session_id = req.session_id or str(uuid.uuid4())
+    flow_id = uuid.uuid4().hex[:12]
+    _log_chat_flow(
+        session_id,
+        flow_id,
+        "request_received",
+        {"new_chat": req.new_chat, "stream": req.stream},
+    )
     if req.new_chat:
         _chat_sessions.pop(session_id, None)
     history = _chat_sessions.get(session_id, [])
+    _log_chat_flow(
+        session_id,
+        flow_id,
+        "session_context_loaded",
+        {"history_turns": len(history) // 2},
+    )
     prompt = _build_session_prompt(history, req.message)
-    is_first_turn = len(history) == 0
-    memory_context = _build_memory_context() if is_first_turn else ""
+    _log_chat_flow(session_id, flow_id, "hermes_memory_lookup_started")
+    memory_context = _build_memory_context(session_id=session_id, flow_id=flow_id)
     if memory_context:
         prompt = f"{memory_context}\n\n{prompt}"
+    _log_chat_flow(
+        session_id,
+        flow_id,
+        "hermes_memory_lookup_completed",
+        {"memory_context_applied": bool(memory_context)},
+    )
+    _write_chat_log(
+        "chat_prompt_ready",
+        {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "history_turns": len(history) // 2,
+            "memory_context_applied": bool(memory_context),
+        },
+    )
 
     url = f"{settings.ollama_base_url}/api/generate"
     payload = {
@@ -494,6 +657,7 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
             user_message=req.message,
             answer=normalized,
             model=model_name,
+            flow_id=flow_id,
         )
 
     if req.stream:
@@ -502,7 +666,7 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
                 url,
                 payload,
                 on_complete=_save_turn,
-                log_context={"session_id": session_id, "model": model_name},
+                log_context={"session_id": session_id, "model": model_name, "flow_id": flow_id},
             ),
             media_type="text/event-stream; charset=utf-8",
             headers={
@@ -515,9 +679,16 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         )
 
     try:
+        _log_chat_flow(session_id, flow_id, "llm_request_started", {"stream": False})
         _write_chat_log(
             "chat_http_request",
-            {"session_id": session_id, "model": model_name, "url": url, "payload": payload, "stream": False},
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "url": url,
+                **_log_prompt_fields(payload),
+            },
         )
         req_obj = request.Request(
             url=url,
@@ -530,9 +701,18 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         answer = _normalize_answer_text(body.get("response", ""))
         _write_chat_log(
             "chat_http_response",
-            {"session_id": session_id, "model": model_name, "stream": False, "answer": answer, "raw_body": body},
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "stream": False,
+                "answer": answer,
+                "raw_body": body,
+            },
         )
+        _log_chat_flow(session_id, flow_id, "llm_response_completed", {"stream": False})
         _save_turn(answer)
+        _log_chat_flow(session_id, flow_id, "request_completed", {"status": "ok"})
         return {
             "answer": answer,
             "model": payload["model"],
@@ -542,14 +722,28 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
     except error.URLError as ex:
         _write_chat_log(
             "chat_http_error",
-            {"session_id": session_id, "model": model_name, "stream": False, "error": str(ex)},
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "stream": False,
+                "error": str(ex),
+            },
         )
+        _log_chat_flow(session_id, flow_id, "request_completed", {"status": "error", "error": str(ex)})
         raise HTTPException(status_code=502, detail=f"Ollama connection failed: {ex}") from ex
     except Exception as ex:
         _write_chat_log(
             "chat_http_error",
-            {"session_id": session_id, "model": model_name, "stream": False, "error": str(ex)},
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "stream": False,
+                "error": str(ex),
+            },
         )
+        _log_chat_flow(session_id, flow_id, "request_completed", {"status": "error", "error": str(ex)})
         raise HTTPException(status_code=500, detail=f"Chat error: {ex}") from ex
 
 
