@@ -719,7 +719,6 @@ def _chat_stream(
                         },
                     )
                     _log_chat_flow(session_id, flow_id, "llm_response_completed", {"stream": True})
-                    yield f"event: decision\ndata: {json.dumps(decision, ensure_ascii=False)}\n\n"
                     yield "event: done\ndata: [DONE]\n\n"
                     done_sent = True
                     break
@@ -748,7 +747,6 @@ def _chat_stream(
                     "llm_response_completed",
                     {"stream": True, "fallback": "upstream_closed_without_done"},
                 )
-                yield f"event: decision\ndata: {json.dumps(decision, ensure_ascii=False)}\n\n"
                 yield "event: done\ndata: [DONE]\n\n"
                 done_sent = True
     except Exception as ex:
