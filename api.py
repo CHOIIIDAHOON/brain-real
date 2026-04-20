@@ -253,18 +253,11 @@ def _decide_memory_with_ollama(
     flow_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     decision_prompt = (
-        "You are a memory gate for a chat assistant.\n"
-        "Decide whether this turn should be saved to long-term global memory.\n"
-        "Return ONLY JSON object with keys:\n"
-        'action: "add" or "skip"\n'
-        "title: short title string\n"
-        "content: memory sentence string\n"
-        "tags: array of short strings\n"
-        "reason: short reason\n"
-        "Rules:\n"
-        "- add only if stable preference/rule/fact that may help future chats.\n"
-        "- skip for small talk, identity of the model, or one-off trivial Q&A.\n"
-        "- If action is skip, still return title/content/tags as empty values.\n\n"
+        "Return ONLY this JSON:\n"
+        '{"action":"add|skip","title":"","content":"","tags":[],"reason":""}\n'
+        "Rule:\n"
+        "- add: stable user profile/preference/rule/fact useful later\n"
+        "- skip: greeting/small talk/one-off\n\n"
         f"USER: {user_message}\n"
         f"ASSISTANT: {answer}\n"
     )
