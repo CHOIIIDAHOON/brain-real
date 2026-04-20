@@ -93,8 +93,54 @@ def _write_chat_log(event: str, payload: Dict[str, Any]) -> None:
         return
 
 
+def _fetch_hermes_memory(limit: int, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    _write_chat_log(
+        "hermes_memory_query_request",
+        {"limit": limit, "session_id": session_id},
+    )
+    rows = hermes_service.list_memory(limit=limit)
+    _write_chat_log(
+        "hermes_memory_query_response",
+        {"limit": limit, "count": len(rows), "session_id": session_id},
+    )
+    return rows
+
+
+def _save_hermes_memory(
+    title: str,
+    content: str,
+    tags: List[str],
+    source: str,
+    session_id: str,
+    user_message: str,
+) -> Dict[str, Any]:
+    _write_chat_log(
+        "hermes_memory_add_request",
+        {
+            "title": title,
+            "content_preview": content[:200],
+            "tags": tags,
+            "source": source,
+            "session_id": session_id,
+        },
+    )
+    row = hermes_service.add_memory(
+        title=title,
+        content=content,
+        tags=tags,
+        source=source,
+        session_id=session_id,
+        user_message=user_message,
+    )
+    _write_chat_log(
+        "hermes_memory_add_response",
+        {"memory_id": row.get("memory_id"), "title": row.get("title"), "session_id": session_id},
+    )
+    return row
+
+
 def _build_memory_context() -> str:
-    rows = hermes_service.list_memory(limit=settings.chat_first_scan_results)
+    rows = _fetch_hermes_memory(limit=settings.chat_first_scan_results)
     if not rows:
         return ""
 
@@ -140,7 +186,7 @@ def _is_duplicate_memory(text: str) -> bool:
     lowered = text.strip().lower()
     if not lowered:
         return True
-    existing = hermes_service.list_memory(limit=100)
+    existing = _fetch_hermes_memory(limit=100)
     for row in existing:
         existing_content = str(row.get("content", "")).strip().lower()
         if existing_content and (existing_content in lowered or lowered in existing_content):
@@ -256,7 +302,7 @@ def _maybe_store_global_memory(session_id: str, user_message: str, answer: str, 
         return
 
     title = decision["title"] or user_message.strip().replace("\n", " ")[:50] or "chat_memory"
-    row = hermes_service.add_memory(
+    row = _save_hermes_memory(
         title=title,
         content=content,
         tags=decision["tags"],
