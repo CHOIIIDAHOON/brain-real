@@ -47,7 +47,11 @@ class Settings:
         self.chat_memory_decision_model = os.getenv("CHAT_MEMORY_DECISION_MODEL", "").strip()
         self.chat_memory_decision_max_chars = int(os.getenv("CHAT_MEMORY_DECISION_MAX_CHARS", "600"))
         self.chat_memory_decision_timeout_seconds = int(os.getenv("CHAT_MEMORY_DECISION_TIMEOUT_SECONDS", "8"))
-        self.chat_memory_decision_num_predict = int(os.getenv("CHAT_MEMORY_DECISION_NUM_PREDICT", "80"))
+        decision_num_predict = os.getenv("CHAT_MEMORY_DECISION_NUM_PREDICT", "").strip()
+        if not decision_num_predict:
+            # Backward compatibility for earlier env name.
+            decision_num_predict = os.getenv("CHAT_MEMORY_DECISION_MAX_TOKENS", "80").strip()
+        self.chat_memory_decision_num_predict = int(decision_num_predict)
         self.chat_memory_skip_short_question_len = int(os.getenv("CHAT_MEMORY_SKIP_SHORT_QUESTION_LEN", "18"))
         self.chat_log_enabled = os.getenv("CHAT_LOG_ENABLED", "true").lower() in {
             "1",
