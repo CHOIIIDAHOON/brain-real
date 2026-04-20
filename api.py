@@ -253,6 +253,22 @@ def _trim_for_memory_decision(text: str, max_chars: int) -> str:
     return f"{normalized[:max_chars].rstrip()}..."
 
 
+def _should_skip_memory_decision(user_message: str, answer: str) -> Optional[str]:
+    user_trimmed = (user_message or "").strip()
+    answer_trimmed = (answer or "").strip()
+    if not user_trimmed or not answer_trimmed:
+        return "empty_text"
+
+    # Avoid costly classifier calls for short, one-off guess/small-talk questions.
+    if (
+        "?" in user_trimmed
+        and len(user_trimmed) <= settings.chat_memory_skip_short_question_len
+        and len(answer_trimmed) <= settings.chat_memory_decision_max_chars
+    ):
+        return "short_question"
+    return None
+
+
 def _decide_memory_with_ollama(
     model: str,
     user_message: str,
@@ -278,6 +294,10 @@ def _decide_memory_with_ollama(
         "prompt": decision_prompt,
         "stream": False,
         "keep_alive": settings.ollama_keep_alive,
+        "options": {
+            "temperature": 0,
+            "num_predict": settings.chat_memory_decision_num_predict,
+        },
     }
     _write_chat_log(
         "memory_decision_http_request",
@@ -297,7 +317,7 @@ def _decide_memory_with_ollama(
         method="POST",
     )
     started_at = perf_counter()
-    with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
+    with request.urlopen(req_obj, timeout=settings.chat_memory_decision_timeout_seconds) as response:
         body = json.loads(response.read().decode("utf-8"))
     latency_ms = int((perf_counter() - started_at) * 1000)
     text = str(body.get("response", "")).strip()
@@ -361,6 +381,13 @@ def _maybe_store_global_memory(
         _write_chat_log(
             "memory_store_skip",
             {"session_id": session_id, "flow_id": flow_id, "reason": "empty_answer"},
+        )
+        return
+    skip_reason = _should_skip_memory_decision(user_message=user_message, answer=answer)
+    if skip_reason:
+        _write_chat_log(
+            "memory_store_skip",
+            {"session_id": session_id, "flow_id": flow_id, "reason": skip_reason},
         )
         return
 
