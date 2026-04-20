@@ -44,6 +44,8 @@ class Settings:
         keywords = os.getenv("CHAT_MEMORY_KEYWORDS", "기억,중요,규칙,선호,일정,해야함")
         self.chat_memory_keywords = [item.strip() for item in keywords.split(",") if item.strip()]
         self.chat_memory_decision_mode = os.getenv("CHAT_MEMORY_DECISION_MODE", "ollama")
+        self.chat_memory_decision_model = os.getenv("CHAT_MEMORY_DECISION_MODEL", "").strip()
+        self.chat_memory_decision_max_chars = int(os.getenv("CHAT_MEMORY_DECISION_MAX_CHARS", "600"))
         self.chat_log_enabled = os.getenv("CHAT_LOG_ENABLED", "true").lower() in {
             "1",
             "true",

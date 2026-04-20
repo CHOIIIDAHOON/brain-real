@@ -3,6 +3,7 @@ import os
 import threading
 import uuid
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any, Callable, Dict, Iterator, List, Optional
 from urllib import error, request
 
@@ -245,6 +246,13 @@ def _is_duplicate_memory(text: str, session_id: Optional[str] = None, flow_id: O
     return False
 
 
+def _trim_for_memory_decision(text: str, max_chars: int) -> str:
+    normalized = (text or "").strip()
+    if max_chars <= 0 or len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[:max_chars].rstrip()}..."
+
+
 def _decide_memory_with_ollama(
     model: str,
     user_message: str,
@@ -252,14 +260,17 @@ def _decide_memory_with_ollama(
     session_id: Optional[str] = None,
     flow_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    max_chars = settings.chat_memory_decision_max_chars
+    user_message_trimmed = _trim_for_memory_decision(user_message, max_chars)
+    answer_trimmed = _trim_for_memory_decision(answer, max_chars)
     decision_prompt = (
         "Return ONLY this JSON:\n"
         '{"action":"add|skip","title":"","content":"","tags":[],"reason":""}\n'
         "Rule:\n"
         "- add: stable user profile/preference/rule/fact useful later\n"
         "- skip: greeting/small talk/one-off\n\n"
-        f"USER: {user_message}\n"
-        f"ASSISTANT: {answer}\n"
+        f"USER: {user_message_trimmed}\n"
+        f"ASSISTANT: {answer_trimmed}\n"
     )
     url = f"{settings.ollama_base_url}/api/generate"
     payload = {
@@ -285,8 +296,10 @@ def _decide_memory_with_ollama(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    started_at = perf_counter()
     with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
         body = json.loads(response.read().decode("utf-8"))
+    latency_ms = int((perf_counter() - started_at) * 1000)
     text = str(body.get("response", "")).strip()
     parsed = _extract_json_object(text) or {}
 
@@ -313,6 +326,12 @@ def _decide_memory_with_ollama(
             "model": model,
             "raw_response": text,
             "parsed": result,
+            "latency_ms": latency_ms,
+            "truncated": {
+                "user_message": user_message_trimmed != user_message.strip(),
+                "assistant_answer": answer_trimmed != answer.strip(),
+                "max_chars": max_chars,
+            },
             "session_id": session_id,
             "flow_id": flow_id,
         },
@@ -345,15 +364,16 @@ def _maybe_store_global_memory(
         )
         return
 
+    decision_model = settings.chat_memory_decision_model or model
     try:
         _log_chat_flow(
             session_id,
             flow_id or "n/a",
             "memory_decision_started",
-            {"model": model},
+            {"model": decision_model},
         )
         decision = _decide_memory_with_ollama(
-            model=model,
+            model=decision_model,
             user_message=user_message,
             answer=answer,
             session_id=session_id,
