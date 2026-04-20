@@ -3,6 +3,7 @@ import os
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from queue import Queue
 from time import perf_counter
 from typing import Any, Callable, Dict, Iterator, List, Optional
 from urllib import error, request
@@ -32,6 +33,9 @@ _stream_headers = {
 }
 _memory_decision_marker = "<<<MEMORY_DECISION>>>"
 _kst = timezone(timedelta(hours=9))
+_memory_task_queue: Queue[Dict[str, Any]] = Queue()
+_memory_worker_started = False
+_memory_worker_lock = threading.Lock()
 
 try:
     import chromadb  # type: ignore
@@ -124,6 +128,36 @@ def _log_chat_flow(session_id: str, flow_id: str, step: str, data: Optional[Dict
             "data": data or {},
         },
     )
+
+
+def _memory_worker_loop() -> None:
+    while True:
+        task = _memory_task_queue.get()
+        try:
+            _maybe_store_global_memory(
+                session_id=str(task.get("session_id", "")),
+                user_message=str(task.get("user_message", "")),
+                answer=str(task.get("answer", "")),
+                model=str(task.get("model", "")),
+                flow_id=str(task.get("flow_id", "")),
+            )
+        except Exception as ex:
+            _write_chat_log("memory_worker_error", {"error": str(ex), "task": task})
+        finally:
+            _memory_task_queue.task_done()
+
+
+def _ensure_memory_worker() -> None:
+    global _memory_worker_started
+    if _memory_worker_started:
+        return
+    with _memory_worker_lock:
+        if _memory_worker_started:
+            return
+        worker = threading.Thread(target=_memory_worker_loop, daemon=True)
+        worker.start()
+        _memory_worker_started = True
+        _write_chat_log("memory_worker_started", {})
 
 
 def _fetch_hermes_memory(
@@ -403,11 +437,14 @@ def _decide_memory_with_ollama(
     user_message_trimmed = _trim_for_memory_decision(user_message, max_chars)
     answer_trimmed = _trim_for_memory_decision(answer, max_chars)
     decision_prompt = (
-        "Return ONLY this JSON:\n"
+        "Return ONLY compact JSON on one line:\n"
         '{"action":"add|skip","title":"","content":"","tags":[],"reason":""}\n'
         "Rule:\n"
         "- add: stable user profile/preference/rule/fact useful later\n"
         "- skip: greeting/small talk/one-off\n\n"
+        "Keep all fields VERY SHORT:\n"
+        '- title <= 8 chars, content <= 20 chars, tags <= 2 items, reason <= 12 chars.\n'
+        '- If skip, use empty title/content/tags and short reason code (smalltalk/profile_missing/oneoff/etc).\n\n'
         f"USER: {user_message_trimmed}\n"
         f"ASSISTANT: {answer_trimmed}\n"
     )
@@ -456,11 +493,15 @@ def _decide_memory_with_ollama(
     if isinstance(tags_raw, list):
         tags = [str(item).strip() for item in tags_raw if str(item).strip()]
     reason = str(parsed.get("reason", "")).strip()
+    # Keep decision payload compact for faster downstream handling/logging.
+    title = title[:32]
+    content = content[:120]
+    reason = reason[:48]
     result = {
         "action": action,
         "title": title,
         "content": content,
-        "tags": tags[:5],
+        "tags": tags[:2],
         "reason": reason,
     }
     _write_chat_log(
@@ -615,22 +656,29 @@ def _schedule_memory_store(
     model: str,
     flow_id: Optional[str] = None,
 ) -> None:
+    _ensure_memory_worker()
+    task = {
+        "session_id": session_id,
+        "flow_id": flow_id or "",
+        "model": model,
+        "user_message": user_message,
+        "answer": answer,
+    }
     _write_chat_log(
         "memory_store_scheduled",
-        {"session_id": session_id, "flow_id": flow_id, "model": model, "user_message": user_message},
-    )
-    worker = threading.Thread(
-        target=_maybe_store_global_memory,
-        kwargs={
+        {
             "session_id": session_id,
-            "user_message": user_message,
-            "answer": answer,
-            "model": model,
             "flow_id": flow_id,
+            "model": model,
+            "user_message": user_message,
+            "queue_size_before": _memory_task_queue.qsize(),
         },
-        daemon=True,
     )
-    worker.start()
+    _memory_task_queue.put(task)
+    _write_chat_log(
+        "memory_store_enqueued",
+        {"session_id": session_id, "flow_id": flow_id, "queue_size_after": _memory_task_queue.qsize()},
+    )
 
 
 def _normalize_answer_text(answer: str) -> str:
@@ -655,14 +703,13 @@ def _normalize_answer_text(answer: str) -> str:
 def _chat_stream(
     url: str,
     payload: Dict[str, Any],
-    on_complete: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    on_complete: Optional[Callable[[str], None]] = None,
     log_context: Optional[Dict[str, Any]] = None,
 ) -> Iterator[str]:
     flow_id = str((log_context or {}).get("flow_id", "n/a"))
     session_id = str((log_context or {}).get("session_id", "n/a"))
     started_at = perf_counter()
     first_token_latency_ms: Optional[int] = None
-    marker_detected_latency_ms: Optional[int] = None
     done_received_latency_ms: Optional[int] = None
     on_complete_latency_ms: Optional[int] = None
     chunk_count = 0
@@ -681,8 +728,7 @@ def _chat_stream(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    response_text = ""
-    emitted_upto = 0
+    answer_parts: List[str] = []
     done_sent = False
     try:
         with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
@@ -706,40 +752,15 @@ def _chat_stream(
                                 "latency_ms": first_token_latency_ms,
                             },
                         )
-                response_text += piece
-                marker_idx = response_text.find(_memory_decision_marker)
-                if marker_idx >= 0 and marker_detected_latency_ms is None:
-                    marker_detected_latency_ms = int((perf_counter() - started_at) * 1000)
-                    _write_chat_log(
-                        "chat_stream_marker_detected",
-                        {
-                            **(log_context or {}),
-                            "latency_ms": marker_detected_latency_ms,
-                            "response_chars": len(response_text),
-                        },
-                    )
-                if marker_idx >= 0:
-                    flush_upto = marker_idx
-                else:
-                    flush_upto = max(0, len(response_text) - (len(_memory_decision_marker) - 1))
-                if flush_upto > emitted_upto:
-                    safe_chunk = response_text[emitted_upto:flush_upto]
-                    for ch in safe_chunk:
+                    answer_parts.append(piece)
+                    for ch in piece:
                         yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
-                    emitted_upto = flush_upto
                 if data.get("done"):
                     done_received_latency_ms = int((perf_counter() - started_at) * 1000)
-                    final_answer, decision, decision_raw, marker_found = _extract_answer_and_memory_decision(
-                        response_text
-                    )
-                    if len(final_answer) > emitted_upto:
-                        tail_chunk = final_answer[emitted_upto:]
-                        for ch in tail_chunk:
-                            yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
-                        emitted_upto = len(final_answer)
+                    final_answer = _normalize_answer_text("".join(answer_parts))
                     if on_complete:
                         on_complete_started = perf_counter()
-                        on_complete(final_answer, decision)
+                        on_complete(final_answer)
                         on_complete_latency_ms = int((perf_counter() - on_complete_started) * 1000)
                     total_latency_ms = int((perf_counter() - started_at) * 1000)
                     _write_chat_log(
@@ -748,8 +769,6 @@ def _chat_stream(
                             **(log_context or {}),
                             "stream": True,
                             "answer": final_answer,
-                            "decision": decision,
-                            "decision_marker_found": marker_found,
                         },
                     )
                     _write_chat_log(
@@ -758,13 +777,10 @@ def _chat_stream(
                             **(log_context or {}),
                             "total_latency_ms": total_latency_ms,
                             "first_token_latency_ms": first_token_latency_ms,
-                            "marker_detected_latency_ms": marker_detected_latency_ms,
                             "done_received_latency_ms": done_received_latency_ms,
                             "on_complete_latency_ms": on_complete_latency_ms,
                             "chunk_count": chunk_count,
                             "answer_chars": len(final_answer),
-                            "decision_chars": len(decision_raw),
-                            "decision_marker_found": marker_found,
                         },
                     )
                     _write_chat_log(
@@ -773,13 +789,8 @@ def _chat_stream(
                             **(log_context or {}),
                             "prefill_ms": first_token_latency_ms,
                             "answer_generation_ms": (
-                                marker_detected_latency_ms - first_token_latency_ms
-                                if first_token_latency_ms is not None and marker_detected_latency_ms is not None
-                                else None
-                            ),
-                            "decision_generation_ms": (
-                                done_received_latency_ms - marker_detected_latency_ms
-                                if done_received_latency_ms is not None and marker_detected_latency_ms is not None
+                                done_received_latency_ms - first_token_latency_ms
+                                if first_token_latency_ms is not None and done_received_latency_ms is not None
                                 else None
                             ),
                             "postprocess_ms": (
@@ -795,15 +806,10 @@ def _chat_stream(
                     break
             if not done_sent:
                 done_received_latency_ms = int((perf_counter() - started_at) * 1000)
-                final_answer, decision, decision_raw, marker_found = _extract_answer_and_memory_decision(response_text)
-                if len(final_answer) > emitted_upto:
-                    tail_chunk = final_answer[emitted_upto:]
-                    for ch in tail_chunk:
-                        yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
-                    emitted_upto = len(final_answer)
+                final_answer = _normalize_answer_text("".join(answer_parts))
                 if on_complete:
                     on_complete_started = perf_counter()
-                    on_complete(final_answer, decision)
+                    on_complete(final_answer)
                     on_complete_latency_ms = int((perf_counter() - on_complete_started) * 1000)
                 total_latency_ms = int((perf_counter() - started_at) * 1000)
                 _write_chat_log(
@@ -812,8 +818,6 @@ def _chat_stream(
                         **(log_context or {}),
                         "reason": "upstream_closed_without_done",
                         "answer": final_answer,
-                        "decision": decision,
-                        "decision_marker_found": marker_found,
                     },
                 )
                 _write_chat_log(
@@ -822,13 +826,10 @@ def _chat_stream(
                         **(log_context or {}),
                         "total_latency_ms": total_latency_ms,
                         "first_token_latency_ms": first_token_latency_ms,
-                        "marker_detected_latency_ms": marker_detected_latency_ms,
                         "done_received_latency_ms": done_received_latency_ms,
                         "on_complete_latency_ms": on_complete_latency_ms,
                         "chunk_count": chunk_count,
                         "answer_chars": len(final_answer),
-                        "decision_chars": len(decision_raw),
-                        "decision_marker_found": marker_found,
                         "fallback": "upstream_closed_without_done",
                     },
                 )
@@ -838,13 +839,8 @@ def _chat_stream(
                         **(log_context or {}),
                         "prefill_ms": first_token_latency_ms,
                         "answer_generation_ms": (
-                            marker_detected_latency_ms - first_token_latency_ms
-                            if first_token_latency_ms is not None and marker_detected_latency_ms is not None
-                            else None
-                        ),
-                        "decision_generation_ms": (
-                            done_received_latency_ms - marker_detected_latency_ms
-                            if done_received_latency_ms is not None and marker_detected_latency_ms is not None
+                            done_received_latency_ms - first_token_latency_ms
+                            if first_token_latency_ms is not None and done_received_latency_ms is not None
                             else None
                         ),
                         "postprocess_ms": (
@@ -888,7 +884,8 @@ def _chat_stream(
                     **(log_context or {}),
                     "total_latency_ms": int((perf_counter() - started_at) * 1000),
                     "first_token_latency_ms": first_token_latency_ms,
-                    "marker_detected_latency_ms": marker_detected_latency_ms,
+                    "done_received_latency_ms": done_received_latency_ms,
+                    "on_complete_latency_ms": on_complete_latency_ms,
                     "chunk_count": chunk_count,
                     "fallback": "finally_guard",
                 },
@@ -928,7 +925,6 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
     memory_context = _build_memory_context(session_id=session_id, flow_id=flow_id)
     if memory_context:
         prompt = f"{memory_context}\n\n{prompt}"
-    prompt = f"{prompt}\n\n{_build_memory_decision_instruction()}"
     _log_chat_flow(
         session_id,
         flow_id,
@@ -962,7 +958,7 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
     client = _client_meta(request_info)
     model_name = str(payload["model"])
 
-    def _save_turn(answer: str, decision: Dict[str, Any]) -> None:
+    def _save_turn(answer: str) -> None:
         normalized = _normalize_answer_text(answer)
         turns = _chat_sessions.setdefault(session_id, [])
         if len(turns) >= 2:
@@ -980,11 +976,11 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         turns.append({"role": "assistant", "content": normalized})
         if len(turns) > _max_session_turns * 2:
             _chat_sessions[session_id] = turns[-(_max_session_turns * 2) :]
-        _apply_memory_decision(
+        _schedule_memory_store(
             session_id=session_id,
             user_message=req.message,
             answer=normalized,
-            decision=decision,
+            model=model_name,
             flow_id=flow_id,
         )
 
@@ -1026,8 +1022,7 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         )
         with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
             body = json.loads(response.read().decode("utf-8"))
-        raw_response = str(body.get("response", ""))
-        answer, decision, _, marker_found = _extract_answer_and_memory_decision(raw_response)
+        answer = _normalize_answer_text(body.get("response", ""))
         _write_chat_log(
             "chat_http_response",
             {
@@ -1036,13 +1031,11 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
                 "model": model_name,
                 "stream": False,
                 "answer": answer,
-                "decision": decision,
-                "decision_marker_found": marker_found,
                 "raw_body": body,
             },
         )
         _log_chat_flow(session_id, flow_id, "llm_response_completed", {"stream": False})
-        _save_turn(answer, decision)
+        _save_turn(answer)
         _log_chat_flow(session_id, flow_id, "request_completed", {"status": "ok"})
         return {
             "answer": answer,
