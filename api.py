@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -269,6 +270,24 @@ def _maybe_store_global_memory(session_id: str, user_message: str, answer: str, 
     )
 
 
+def _schedule_memory_store(session_id: str, user_message: str, answer: str, model: str) -> None:
+    _write_chat_log(
+        "memory_store_scheduled",
+        {"session_id": session_id, "model": model, "user_message": user_message},
+    )
+    worker = threading.Thread(
+        target=_maybe_store_global_memory,
+        kwargs={
+            "session_id": session_id,
+            "user_message": user_message,
+            "answer": answer,
+            "model": model,
+        },
+        daemon=True,
+    )
+    worker.start()
+
+
 def _normalize_answer_text(answer: str) -> str:
     text = (answer or "").strip()
     if not text:
@@ -310,6 +329,7 @@ def _chat_stream(
         method="POST",
     )
     answer_parts: List[str] = []
+    done_sent = False
     try:
         with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
             for raw_line in response:
@@ -337,13 +357,35 @@ def _chat_stream(
                         },
                     )
                     yield "event: done\ndata: [DONE]\n\n"
+                    done_sent = True
                     break
+            if not done_sent:
+                final_answer = "".join(answer_parts)
+                if on_complete:
+                    on_complete(final_answer)
+                _write_chat_log(
+                    "chat_stream_done_fallback",
+                    {
+                        **(log_context or {}),
+                        "reason": "upstream_closed_without_done",
+                        "answer": _normalize_answer_text(final_answer),
+                    },
+                )
+                yield "event: done\ndata: [DONE]\n\n"
+                done_sent = True
     except Exception as ex:
         _write_chat_log(
             "chat_http_error",
             {**(log_context or {}), "stream": True, "error": str(ex)},
         )
         yield f"event: error\ndata: {json.dumps({'error': str(ex)}, ensure_ascii=False)}\n\n"
+    finally:
+        if not done_sent:
+            _write_chat_log(
+                "chat_stream_done_fallback",
+                {**(log_context or {}), "reason": "finally_guard"},
+            )
+            yield "event: done\ndata: [DONE]\n\n"
 
 
 def _client_meta(req: Request) -> Dict[str, str]:
@@ -401,7 +443,7 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         turns.append({"role": "assistant", "content": normalized})
         if len(turns) > _max_session_turns * 2:
             _chat_sessions[session_id] = turns[-(_max_session_turns * 2) :]
-        _maybe_store_global_memory(
+        _schedule_memory_store(
             session_id=session_id,
             user_message=req.message,
             answer=normalized,
