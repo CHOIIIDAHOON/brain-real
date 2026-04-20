@@ -2,7 +2,7 @@ import json
 import os
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any, Callable, Dict, Iterator, List, Optional
 from urllib import error, request
@@ -31,6 +31,7 @@ _stream_headers = {
     "X-Accel-Buffering": "no",
 }
 _memory_decision_marker = "<<<MEMORY_DECISION>>>"
+_kst = timezone(timedelta(hours=9))
 
 try:
     import chromadb  # type: ignore
@@ -83,13 +84,13 @@ def _write_chat_log(event: str, payload: Dict[str, Any]) -> None:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        timestamp = datetime.now(_kst).strftime("%Y.%m.%d %H:%M:%S")
         row = {
-            "ts": datetime.now(timezone.utc).isoformat(),
             "event": event,
             "payload": payload,
         }
         with open(path, "a", encoding="utf-8") as fp:
-            fp.write(json.dumps(row, ensure_ascii=False) + "\n\n")
+            fp.write(f"[{timestamp}] {json.dumps(row, ensure_ascii=False)}\n\n")
     except Exception:
         # Logging must never break chat flow.
         return
