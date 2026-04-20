@@ -1,5 +1,7 @@
 import json
+import os
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional
 from urllib import error, request
 
@@ -70,6 +72,26 @@ def _build_session_prompt(history: List[Dict[str, str]], current_message: str) -
     return "\n".join(lines)
 
 
+def _write_chat_log(event: str, payload: Dict[str, Any]) -> None:
+    if not settings.chat_log_enabled:
+        return
+    try:
+        path = settings.chat_log_path
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "payload": payload,
+        }
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        # Logging must never break chat flow.
+        return
+
+
 def _build_memory_context() -> str:
     rows = hermes_service.list_memory(limit=settings.chat_first_scan_results)
     if not rows:
@@ -89,46 +111,162 @@ def _build_memory_context() -> str:
     return "\n".join(lines)
 
 
-def _memory_candidate(session_id: str, user_message: str, answer: str) -> Dict[str, Any]:
-    reason_parts: List[str] = []
-    score = 0
-    text = f"{user_message}\n{answer}".strip()
-    lowered = text.lower()
+def _extract_json_object(raw_text: str) -> Optional[Dict[str, Any]]:
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
 
-    if len(text) >= settings.chat_memory_min_len:
-        score += 1
-        reason_parts.append("length")
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        return None
+    return None
 
-    matched_keywords = [kw for kw in settings.chat_memory_keywords if kw and kw.lower() in lowered]
-    if matched_keywords:
-        score += 1
-        reason_parts.append("keywords")
 
-    duplicate = False
-    existing = hermes_service.list_memory(limit=50)
+def _is_duplicate_memory(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return True
+    existing = hermes_service.list_memory(limit=100)
     for row in existing:
         existing_content = str(row.get("content", "")).strip().lower()
         if existing_content and (existing_content in lowered or lowered in existing_content):
-            duplicate = True
-            break
-    if duplicate:
-        reason_parts.append("duplicate")
+            return True
+    return False
 
-    should_add = score >= 2 and not duplicate
-    title_base = user_message.strip().replace("\n", " ")
-    if len(title_base) > 50:
-        title_base = f"{title_base[:50]}..."
-    candidate = {
-        "should_add": should_add,
-        "title": title_base or "chat_memory",
-        "content": text,
-        "tags": [kw for kw in matched_keywords[:5]],
-        "reason": ",".join(reason_parts) or "none",
-        "session_id": session_id,
-        "source": "chat",
-        "user_message": user_message,
+
+def _decide_memory_with_ollama(model: str, user_message: str, answer: str) -> Dict[str, Any]:
+    decision_prompt = (
+        "You are a memory gate for a chat assistant.\n"
+        "Decide whether this turn should be saved to long-term global memory.\n"
+        "Return ONLY JSON object with keys:\n"
+        'action: "add" or "skip"\n'
+        "title: short title string\n"
+        "content: memory sentence string\n"
+        "tags: array of short strings\n"
+        "reason: short reason\n"
+        "Rules:\n"
+        "- add only if stable preference/rule/fact that may help future chats.\n"
+        "- skip for small talk, identity of the model, or one-off trivial Q&A.\n"
+        "- If action is skip, still return title/content/tags as empty values.\n\n"
+        f"USER: {user_message}\n"
+        f"ASSISTANT: {answer}\n"
+    )
+    url = f"{settings.ollama_base_url}/api/generate"
+    payload = {
+        "model": model,
+        "prompt": decision_prompt,
+        "stream": False,
+        "keep_alive": settings.ollama_keep_alive,
     }
-    return candidate
+    _write_chat_log(
+        "memory_decision_http_request",
+        {
+            "model": model,
+            "url": url,
+            "payload": payload,
+            "user_message": user_message,
+        },
+    )
+    req_obj = request.Request(
+        url=url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    text = str(body.get("response", "")).strip()
+    parsed = _extract_json_object(text) or {}
+
+    action = str(parsed.get("action", "skip")).strip().lower()
+    if action not in {"add", "skip"}:
+        action = "skip"
+    title = str(parsed.get("title", "")).strip()
+    content = str(parsed.get("content", "")).strip()
+    tags_raw = parsed.get("tags", [])
+    tags: List[str] = []
+    if isinstance(tags_raw, list):
+        tags = [str(item).strip() for item in tags_raw if str(item).strip()]
+    reason = str(parsed.get("reason", "")).strip()
+    result = {
+        "action": action,
+        "title": title,
+        "content": content,
+        "tags": tags[:5],
+        "reason": reason,
+    }
+    _write_chat_log(
+        "memory_decision_http_response",
+        {
+            "model": model,
+            "raw_response": text,
+            "parsed": result,
+        },
+    )
+    return result
+
+
+def _maybe_store_global_memory(session_id: str, user_message: str, answer: str, model: str) -> None:
+    if settings.chat_memory_decision_mode.lower() != "ollama":
+        _write_chat_log(
+            "memory_store_skip",
+            {"session_id": session_id, "reason": "decision_mode_off", "mode": settings.chat_memory_decision_mode},
+        )
+        return
+    if not answer.strip():
+        _write_chat_log("memory_store_skip", {"session_id": session_id, "reason": "empty_answer"})
+        return
+
+    try:
+        decision = _decide_memory_with_ollama(model=model, user_message=user_message, answer=answer)
+    except Exception as ex:
+        _write_chat_log(
+            "memory_store_skip",
+            {"session_id": session_id, "reason": "decision_error", "error": str(ex)},
+        )
+        return
+
+    if decision["action"] != "add":
+        _write_chat_log(
+            "memory_store_skip",
+            {"session_id": session_id, "reason": "decision_skip", "decision": decision},
+        )
+        return
+
+    content = decision["content"] or f"{user_message}\n{answer}"
+    if _is_duplicate_memory(content):
+        _write_chat_log(
+            "memory_store_skip",
+            {"session_id": session_id, "reason": "duplicate", "content_preview": content[:200]},
+        )
+        return
+
+    title = decision["title"] or user_message.strip().replace("\n", " ")[:50] or "chat_memory"
+    row = hermes_service.add_memory(
+        title=title,
+        content=content,
+        tags=decision["tags"],
+        source="chat_auto",
+        session_id=session_id,
+        user_message=user_message,
+    )
+    _write_chat_log(
+        "memory_store_add",
+        {"session_id": session_id, "decision": decision, "memory_id": row.get("memory_id"), "title": title},
+    )
 
 
 def _normalize_answer_text(answer: str) -> str:
@@ -151,8 +289,20 @@ def _normalize_answer_text(answer: str) -> str:
 
 
 def _chat_stream(
-    url: str, payload: Dict[str, Any], on_complete: Optional[Callable[[str], Dict[str, Any]]] = None
+    url: str,
+    payload: Dict[str, Any],
+    on_complete: Optional[Callable[[str], None]] = None,
+    log_context: Optional[Dict[str, Any]] = None,
 ) -> Iterator[str]:
+    _write_chat_log(
+        "chat_http_request",
+        {
+            **(log_context or {}),
+            "url": url,
+            "payload": payload,
+            "stream": True,
+        },
+    )
     req_obj = request.Request(
         url=url,
         data=json.dumps(payload).encode("utf-8"),
@@ -175,17 +325,24 @@ def _chat_stream(
                 for ch in piece:
                     yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
                 if data.get("done"):
-                    completion_data = None
+                    final_answer = "".join(answer_parts)
                     if on_complete:
-                        completion_data = on_complete("".join(answer_parts))
-                    if completion_data is not None:
-                        yield (
-                            "event: memory_candidate\n"
-                            f"data: {json.dumps(completion_data, ensure_ascii=False)}\n\n"
-                        )
+                        on_complete(final_answer)
+                    _write_chat_log(
+                        "chat_http_response",
+                        {
+                            **(log_context or {}),
+                            "stream": True,
+                            "answer": _normalize_answer_text(final_answer),
+                        },
+                    )
                     yield "event: done\ndata: [DONE]\n\n"
                     break
     except Exception as ex:
+        _write_chat_log(
+            "chat_http_error",
+            {**(log_context or {}), "stream": True, "error": str(ex)},
+        )
         yield f"event: error\ndata: {json.dumps({'error': str(ex)}, ensure_ascii=False)}\n\n"
 
 
@@ -224,8 +381,9 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
     if keep_alive:
         payload["keep_alive"] = keep_alive
     client = _client_meta(request_info)
+    model_name = str(payload["model"])
 
-    def _save_turn(answer: str) -> Dict[str, Any]:
+    def _save_turn(answer: str) -> None:
         normalized = _normalize_answer_text(answer)
         turns = _chat_sessions.setdefault(session_id, [])
         if len(turns) >= 2:
@@ -237,17 +395,27 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
                 and last_user.get("content") == req.message
                 and last_assistant.get("content") == normalized
             ):
-                return _memory_candidate(session_id=session_id, user_message=req.message, answer=normalized)
+                return
 
         turns.append({"role": "user", "content": req.message})
         turns.append({"role": "assistant", "content": normalized})
         if len(turns) > _max_session_turns * 2:
             _chat_sessions[session_id] = turns[-(_max_session_turns * 2) :]
-        return _memory_candidate(session_id=session_id, user_message=req.message, answer=normalized)
+        _maybe_store_global_memory(
+            session_id=session_id,
+            user_message=req.message,
+            answer=normalized,
+            model=model_name,
+        )
 
     if req.stream:
         return StreamingResponse(
-            _chat_stream(url, payload, on_complete=_save_turn),
+            _chat_stream(
+                url,
+                payload,
+                on_complete=_save_turn,
+                log_context={"session_id": session_id, "model": model_name},
+            ),
             media_type="text/event-stream; charset=utf-8",
             headers={
                 **_stream_headers,
@@ -259,6 +427,10 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         )
 
     try:
+        _write_chat_log(
+            "chat_http_request",
+            {"session_id": session_id, "model": model_name, "url": url, "payload": payload, "stream": False},
+        )
         req_obj = request.Request(
             url=url,
             data=json.dumps(payload).encode("utf-8"),
@@ -268,17 +440,28 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
             body = json.loads(response.read().decode("utf-8"))
         answer = _normalize_answer_text(body.get("response", ""))
-        memory_candidate = _save_turn(answer)
+        _write_chat_log(
+            "chat_http_response",
+            {"session_id": session_id, "model": model_name, "stream": False, "answer": answer, "raw_body": body},
+        )
+        _save_turn(answer)
         return {
             "answer": answer,
             "model": payload["model"],
             "client": client,
             "session_id": session_id,
-            "memory_candidate": memory_candidate,
         }
     except error.URLError as ex:
+        _write_chat_log(
+            "chat_http_error",
+            {"session_id": session_id, "model": model_name, "stream": False, "error": str(ex)},
+        )
         raise HTTPException(status_code=502, detail=f"Ollama connection failed: {ex}") from ex
     except Exception as ex:
+        _write_chat_log(
+            "chat_http_error",
+            {"session_id": session_id, "model": model_name, "stream": False, "error": str(ex)},
+        )
         raise HTTPException(status_code=500, detail=f"Chat error: {ex}") from ex
 
 
