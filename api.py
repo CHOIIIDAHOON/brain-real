@@ -89,7 +89,7 @@ def _write_chat_log(event: str, payload: Dict[str, Any]) -> None:
             "payload": payload,
         }
         with open(path, "a", encoding="utf-8") as fp:
-            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n\n")
     except Exception:
         # Logging must never break chat flow.
         return
@@ -659,6 +659,10 @@ def _chat_stream(
 ) -> Iterator[str]:
     flow_id = str((log_context or {}).get("flow_id", "n/a"))
     session_id = str((log_context or {}).get("session_id", "n/a"))
+    started_at = perf_counter()
+    first_token_latency_ms: Optional[int] = None
+    marker_detected_latency_ms: Optional[int] = None
+    chunk_count = 0
     _log_chat_flow(session_id, flow_id, "llm_request_started", {"stream": True})
     _write_chat_log(
         "chat_http_request",
@@ -688,8 +692,29 @@ def _chat_stream(
                 except json.JSONDecodeError:
                     continue
                 piece = data.get("response", "")
+                if piece:
+                    chunk_count += 1
+                    if first_token_latency_ms is None:
+                        first_token_latency_ms = int((perf_counter() - started_at) * 1000)
+                        _write_chat_log(
+                            "chat_stream_first_token",
+                            {
+                                **(log_context or {}),
+                                "latency_ms": first_token_latency_ms,
+                            },
+                        )
                 response_text += piece
                 marker_idx = response_text.find(_memory_decision_marker)
+                if marker_idx >= 0 and marker_detected_latency_ms is None:
+                    marker_detected_latency_ms = int((perf_counter() - started_at) * 1000)
+                    _write_chat_log(
+                        "chat_stream_marker_detected",
+                        {
+                            **(log_context or {}),
+                            "latency_ms": marker_detected_latency_ms,
+                            "response_chars": len(response_text),
+                        },
+                    )
                 if marker_idx >= 0:
                     flush_upto = marker_idx
                 else:
@@ -718,6 +743,18 @@ def _chat_stream(
                             "decision_marker_found": marker_found,
                         },
                     )
+                    _write_chat_log(
+                        "chat_stream_timing",
+                        {
+                            **(log_context or {}),
+                            "total_latency_ms": int((perf_counter() - started_at) * 1000),
+                            "first_token_latency_ms": first_token_latency_ms,
+                            "marker_detected_latency_ms": marker_detected_latency_ms,
+                            "chunk_count": chunk_count,
+                            "answer_chars": len(final_answer),
+                            "decision_marker_found": marker_found,
+                        },
+                    )
                     _log_chat_flow(session_id, flow_id, "llm_response_completed", {"stream": True})
                     yield "event: done\ndata: [DONE]\n\n"
                     done_sent = True
@@ -739,6 +776,19 @@ def _chat_stream(
                         "answer": final_answer,
                         "decision": decision,
                         "decision_marker_found": marker_found,
+                    },
+                )
+                _write_chat_log(
+                    "chat_stream_timing",
+                    {
+                        **(log_context or {}),
+                        "total_latency_ms": int((perf_counter() - started_at) * 1000),
+                        "first_token_latency_ms": first_token_latency_ms,
+                        "marker_detected_latency_ms": marker_detected_latency_ms,
+                        "chunk_count": chunk_count,
+                        "answer_chars": len(final_answer),
+                        "decision_marker_found": marker_found,
+                        "fallback": "upstream_closed_without_done",
                     },
                 )
                 _log_chat_flow(
@@ -767,6 +817,17 @@ def _chat_stream(
                 flow_id,
                 "llm_response_completed",
                 {"stream": True, "fallback": "finally_guard"},
+            )
+            _write_chat_log(
+                "chat_stream_timing",
+                {
+                    **(log_context or {}),
+                    "total_latency_ms": int((perf_counter() - started_at) * 1000),
+                    "first_token_latency_ms": first_token_latency_ms,
+                    "marker_detected_latency_ms": marker_detected_latency_ms,
+                    "chunk_count": chunk_count,
+                    "fallback": "finally_guard",
+                },
             )
             yield "event: done\ndata: [DONE]\n\n"
 
