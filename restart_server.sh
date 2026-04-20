@@ -20,16 +20,16 @@ fi
 APP_HOST="${APP_HOST:-127.0.0.1}"
 APP_PORT="${APP_PORT:-8000}"
 LOG_FILE="${LOG_FILE:-app.log}"
-CHAT_MEMORY_DECISION_MODEL="${CHAT_MEMORY_DECISION_MODEL:-exaone3.5:2.4b}"
 
-export CHAT_MEMORY_DECISION_MODEL
+# If CHAT_MEMORY_DECISION_MODEL is unset, backend falls back to the chat model.
+unset CHAT_MEMORY_DECISION_MODEL
 
 echo "[restart] stopping old uvicorn..."
 pkill -f "uvicorn main:app" || true
 sleep 1
 
 echo "[restart] starting uvicorn on ${APP_HOST}:${APP_PORT}..."
-echo "[restart] memory decision model=${CHAT_MEMORY_DECISION_MODEL}"
+echo "[restart] memory decision model=chat model fallback"
 nohup uvicorn main:app --host "$APP_HOST" --port "$APP_PORT" > "$LOG_FILE" 2>&1 &
 
 sleep 1
