@@ -131,6 +131,25 @@ def _memory_candidate(session_id: str, user_message: str, answer: str) -> Dict[s
     return candidate
 
 
+def _normalize_answer_text(answer: str) -> str:
+    text = (answer or "").strip()
+    if not text:
+        return ""
+
+    # Handles cases like "A...A..." where whole answer is duplicated once.
+    half = len(text) // 2
+    if len(text) % 2 == 0 and half >= 10 and text[:half] == text[half:]:
+        return text[:half].strip()
+
+    # Handles line-based duplicated blocks.
+    lines = text.splitlines()
+    line_half = len(lines) // 2
+    if len(lines) % 2 == 0 and line_half >= 1 and lines[:line_half] == lines[line_half:]:
+        return "\n".join(lines[:line_half]).strip()
+
+    return text
+
+
 def _chat_stream(
     url: str, payload: Dict[str, Any], on_complete: Optional[Callable[[str], Dict[str, Any]]] = None
 ) -> Iterator[str]:
@@ -207,12 +226,24 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
     client = _client_meta(request_info)
 
     def _save_turn(answer: str) -> Dict[str, Any]:
+        normalized = _normalize_answer_text(answer)
         turns = _chat_sessions.setdefault(session_id, [])
+        if len(turns) >= 2:
+            last_user = turns[-2]
+            last_assistant = turns[-1]
+            if (
+                last_user.get("role") == "user"
+                and last_assistant.get("role") == "assistant"
+                and last_user.get("content") == req.message
+                and last_assistant.get("content") == normalized
+            ):
+                return _memory_candidate(session_id=session_id, user_message=req.message, answer=normalized)
+
         turns.append({"role": "user", "content": req.message})
-        turns.append({"role": "assistant", "content": answer})
+        turns.append({"role": "assistant", "content": normalized})
         if len(turns) > _max_session_turns * 2:
             _chat_sessions[session_id] = turns[-(_max_session_turns * 2) :]
-        return _memory_candidate(session_id=session_id, user_message=req.message, answer=answer)
+        return _memory_candidate(session_id=session_id, user_message=req.message, answer=normalized)
 
     if req.stream:
         return StreamingResponse(
@@ -236,7 +267,7 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         )
         with request.urlopen(req_obj, timeout=settings.ollama_timeout_seconds) as response:
             body = json.loads(response.read().decode("utf-8"))
-        answer = body.get("response", "")
+        answer = _normalize_answer_text(body.get("response", ""))
         memory_candidate = _save_turn(answer)
         return {
             "answer": answer,
