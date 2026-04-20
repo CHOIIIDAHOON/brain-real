@@ -56,6 +56,9 @@ class MemoryAddRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     content: str = Field(min_length=1)
     tags: List[str] = Field(default_factory=list)
+    source: str = Field(default="manual", min_length=1, max_length=50)
+    session_id: Optional[str] = None
+    user_message: Optional[str] = None
 
 
 class MemorySearchRequest(BaseModel):

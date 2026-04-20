@@ -109,14 +109,21 @@ def create_skill(req: SkillCreateRequest) -> Dict[str, Any]:
 
 # 저장된 메모리 목록을 조회한다.
 @hermes_router.get("/memory")
-def list_memory() -> Dict[str, Any]:
-    return {"items": hermes_service.list_memory()}
+def list_memory(limit: int = 50) -> Dict[str, Any]:
+    return {"items": hermes_service.list_memory(limit=limit)}
 
 
 # 새 메모리 항목을 저장한다.
 @hermes_router.post("/memory")
 def add_memory(req: MemoryAddRequest) -> Dict[str, Any]:
-    row = hermes_service.add_memory(title=req.title, content=req.content, tags=req.tags)
+    row = hermes_service.add_memory(
+        title=req.title,
+        content=req.content,
+        tags=req.tags,
+        source=req.source,
+        session_id=req.session_id,
+        user_message=req.user_message,
+    )
     return {"status": "ok", "memory": row}
 
 

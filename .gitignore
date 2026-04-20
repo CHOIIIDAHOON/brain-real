@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+chromaDB/chroma.sqlite3

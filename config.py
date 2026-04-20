@@ -39,6 +39,10 @@ class Settings:
                 "- 추가 설명은 사용자가 요청할 때만 제공."
             ),
         )
+        self.chat_first_scan_results = int(os.getenv("CHAT_FIRST_SCAN_RESULTS", "3"))
+        self.chat_memory_min_len = int(os.getenv("CHAT_MEMORY_MIN_LEN", "20"))
+        keywords = os.getenv("CHAT_MEMORY_KEYWORDS", "기억,중요,규칙,선호,일정,해야함")
+        self.chat_memory_keywords = [item.strip() for item in keywords.split(",") if item.strip()]
 
 
 settings = Settings()

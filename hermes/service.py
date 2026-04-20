@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from .schemas import FeatureItem
@@ -132,15 +133,29 @@ class HermesService:
         self._skills.append(row)
         return row
 
-    def list_memory(self) -> List[Dict[str, Any]]:
-        return self._memories
+    def list_memory(self, limit: int = 50) -> List[Dict[str, Any]]:
+        if limit <= 0:
+            return []
+        return list(reversed(self._memories[-limit:]))
 
-    def add_memory(self, title: str, content: str, tags: List[str]) -> Dict[str, Any]:
+    def add_memory(
+        self,
+        title: str,
+        content: str,
+        tags: List[str],
+        source: str = "manual",
+        session_id: str | None = None,
+        user_message: str | None = None,
+    ) -> Dict[str, Any]:
         row = {
             "memory_id": str(uuid.uuid4()),
             "title": title,
             "content": content,
             "tags": tags,
+            "source": source,
+            "session_id": session_id,
+            "user_message": user_message,
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self._memories.append(row)
         return row
