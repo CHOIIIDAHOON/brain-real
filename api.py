@@ -663,6 +663,8 @@ def _chat_stream(
     started_at = perf_counter()
     first_token_latency_ms: Optional[int] = None
     marker_detected_latency_ms: Optional[int] = None
+    done_received_latency_ms: Optional[int] = None
+    on_complete_latency_ms: Optional[int] = None
     chunk_count = 0
     _log_chat_flow(session_id, flow_id, "llm_request_started", {"stream": True})
     _write_chat_log(
@@ -726,14 +728,20 @@ def _chat_stream(
                         yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
                     emitted_upto = flush_upto
                 if data.get("done"):
-                    final_answer, decision, _, marker_found = _extract_answer_and_memory_decision(response_text)
+                    done_received_latency_ms = int((perf_counter() - started_at) * 1000)
+                    final_answer, decision, decision_raw, marker_found = _extract_answer_and_memory_decision(
+                        response_text
+                    )
                     if len(final_answer) > emitted_upto:
                         tail_chunk = final_answer[emitted_upto:]
                         for ch in tail_chunk:
                             yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
                         emitted_upto = len(final_answer)
                     if on_complete:
+                        on_complete_started = perf_counter()
                         on_complete(final_answer, decision)
+                        on_complete_latency_ms = int((perf_counter() - on_complete_started) * 1000)
+                    total_latency_ms = int((perf_counter() - started_at) * 1000)
                     _write_chat_log(
                         "chat_http_response",
                         {
@@ -748,12 +756,37 @@ def _chat_stream(
                         "chat_stream_timing",
                         {
                             **(log_context or {}),
-                            "total_latency_ms": int((perf_counter() - started_at) * 1000),
+                            "total_latency_ms": total_latency_ms,
                             "first_token_latency_ms": first_token_latency_ms,
                             "marker_detected_latency_ms": marker_detected_latency_ms,
+                            "done_received_latency_ms": done_received_latency_ms,
+                            "on_complete_latency_ms": on_complete_latency_ms,
                             "chunk_count": chunk_count,
                             "answer_chars": len(final_answer),
+                            "decision_chars": len(decision_raw),
                             "decision_marker_found": marker_found,
+                        },
+                    )
+                    _write_chat_log(
+                        "chat_stream_phase_breakdown",
+                        {
+                            **(log_context or {}),
+                            "prefill_ms": first_token_latency_ms,
+                            "answer_generation_ms": (
+                                marker_detected_latency_ms - first_token_latency_ms
+                                if first_token_latency_ms is not None and marker_detected_latency_ms is not None
+                                else None
+                            ),
+                            "decision_generation_ms": (
+                                done_received_latency_ms - marker_detected_latency_ms
+                                if done_received_latency_ms is not None and marker_detected_latency_ms is not None
+                                else None
+                            ),
+                            "postprocess_ms": (
+                                total_latency_ms - done_received_latency_ms
+                                if done_received_latency_ms is not None
+                                else None
+                            ),
                         },
                     )
                     _log_chat_flow(session_id, flow_id, "llm_response_completed", {"stream": True})
@@ -761,14 +794,18 @@ def _chat_stream(
                     done_sent = True
                     break
             if not done_sent:
-                final_answer, decision, _, marker_found = _extract_answer_and_memory_decision(response_text)
+                done_received_latency_ms = int((perf_counter() - started_at) * 1000)
+                final_answer, decision, decision_raw, marker_found = _extract_answer_and_memory_decision(response_text)
                 if len(final_answer) > emitted_upto:
                     tail_chunk = final_answer[emitted_upto:]
                     for ch in tail_chunk:
                         yield f"data: {json.dumps({'text': ch}, ensure_ascii=False)}\n\n"
                     emitted_upto = len(final_answer)
                 if on_complete:
+                    on_complete_started = perf_counter()
                     on_complete(final_answer, decision)
+                    on_complete_latency_ms = int((perf_counter() - on_complete_started) * 1000)
+                total_latency_ms = int((perf_counter() - started_at) * 1000)
                 _write_chat_log(
                     "chat_stream_done_fallback",
                     {
@@ -783,12 +820,38 @@ def _chat_stream(
                     "chat_stream_timing",
                     {
                         **(log_context or {}),
-                        "total_latency_ms": int((perf_counter() - started_at) * 1000),
+                        "total_latency_ms": total_latency_ms,
                         "first_token_latency_ms": first_token_latency_ms,
                         "marker_detected_latency_ms": marker_detected_latency_ms,
+                        "done_received_latency_ms": done_received_latency_ms,
+                        "on_complete_latency_ms": on_complete_latency_ms,
                         "chunk_count": chunk_count,
                         "answer_chars": len(final_answer),
+                        "decision_chars": len(decision_raw),
                         "decision_marker_found": marker_found,
+                        "fallback": "upstream_closed_without_done",
+                    },
+                )
+                _write_chat_log(
+                    "chat_stream_phase_breakdown",
+                    {
+                        **(log_context or {}),
+                        "prefill_ms": first_token_latency_ms,
+                        "answer_generation_ms": (
+                            marker_detected_latency_ms - first_token_latency_ms
+                            if first_token_latency_ms is not None and marker_detected_latency_ms is not None
+                            else None
+                        ),
+                        "decision_generation_ms": (
+                            done_received_latency_ms - marker_detected_latency_ms
+                            if done_received_latency_ms is not None and marker_detected_latency_ms is not None
+                            else None
+                        ),
+                        "postprocess_ms": (
+                            total_latency_ms - done_received_latency_ms
+                            if done_received_latency_ms is not None
+                            else None
+                        ),
                         "fallback": "upstream_closed_without_done",
                     },
                 )
