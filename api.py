@@ -71,6 +71,9 @@ class ChromaSearchRequest(BaseModel):
 
 
 def _build_session_prompt(history: List[Dict[str, str]], current_message: str) -> str:
+    max_turns = settings.chat_prompt_max_turns
+    if max_turns > 0 and len(history) > max_turns * 2:
+        history = history[-(max_turns * 2) :]
     lines: List[str] = []
     for item in history:
         role = item.get("role", "user").upper()
@@ -944,18 +947,24 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
         session_id,
         flow_id,
         "session_context_loaded",
-        {"history_turns": len(history) // 2},
+        {"history_turns": len(history) // 2, "prompt_max_turns": settings.chat_prompt_max_turns},
     )
     prompt = _build_session_prompt(history, req.message)
     _log_chat_flow(session_id, flow_id, "hermes_memory_lookup_started")
-    memory_context = _build_memory_context(session_id=session_id, flow_id=flow_id)
+    use_memory_context = True
+    if settings.chat_memory_context_first_turn_only and len(history) > 0:
+        use_memory_context = False
+    memory_context = _build_memory_context(session_id=session_id, flow_id=flow_id) if use_memory_context else ""
     if memory_context:
         prompt = f"{memory_context}\n\n{prompt}"
     _log_chat_flow(
         session_id,
         flow_id,
         "hermes_memory_lookup_completed",
-        {"memory_context_applied": bool(memory_context)},
+        {
+            "memory_context_applied": bool(memory_context),
+            "memory_context_first_turn_only": settings.chat_memory_context_first_turn_only,
+        },
     )
     _write_chat_log(
         "chat_prompt_ready",
@@ -964,6 +973,7 @@ def chat(req: ChatRequest, request_info: Request) -> Any:
             "flow_id": flow_id,
             "history_turns": len(history) // 2,
             "memory_context_applied": bool(memory_context),
+            "prompt_chars": len(prompt),
         },
     )
 
