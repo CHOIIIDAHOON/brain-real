@@ -36,6 +36,8 @@ _kst = timezone(timedelta(hours=9))
 _memory_task_queue: Queue[Dict[str, Any]] = Queue()
 _memory_worker_started = False
 _memory_worker_lock = threading.Lock()
+_memory_schedule_lock = threading.Lock()
+_session_memory_last_scheduled: Dict[str, float] = {}
 
 try:
     import chromadb  # type: ignore
@@ -661,6 +663,26 @@ def _schedule_memory_store(
     flow_id: Optional[str] = None,
 ) -> None:
     _ensure_memory_worker()
+    cooldown_seconds = settings.chat_memory_session_cooldown_seconds
+    now = perf_counter()
+    if cooldown_seconds > 0:
+        with _memory_schedule_lock:
+            last_scheduled = _session_memory_last_scheduled.get(session_id)
+            if last_scheduled is not None and (now - last_scheduled) < cooldown_seconds:
+                remaining_ms = int((cooldown_seconds - (now - last_scheduled)) * 1000)
+                _write_chat_log(
+                    "memory_store_skip",
+                    {
+                        "session_id": session_id,
+                        "flow_id": flow_id,
+                        "reason": "session_cooldown",
+                        "cooldown_seconds": cooldown_seconds,
+                        "remaining_ms": max(remaining_ms, 0),
+                    },
+                )
+                return
+            _session_memory_last_scheduled[session_id] = now
+
     task = {
         "session_id": session_id,
         "flow_id": flow_id or "",
