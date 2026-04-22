@@ -246,15 +246,15 @@ def extract_json_object(raw_text):
 
 # 메모리 저장 의사결정 결과를 안전한 값으로 정규화한다.
 def normalize_memory_decision(parsed_data):
-    def to_ascii_text(value, fallback):
+    def to_stored_field(value, fallback, max_len):
+        """Strip/whitespace collapse; keep UTF-8 (Korean etc.) so facts are not collapsed to ASCII fallbacks."""
         text = str(value or "").strip()
         if not text:
             return fallback
-        ascii_text = text.encode("ascii", "ignore").decode("ascii").strip()
-        if not ascii_text:
-            return fallback
-        ascii_text = re.sub(r"\s+", " ", ascii_text)
-        return ascii_text[:120]
+        text = re.sub(r"\s+", " ", text)
+        if max_len > 0 and len(text) > max_len:
+            text = text[:max_len].rstrip()
+        return text or fallback
 
     def to_ascii_tag(value):
         text = str(value or "").strip()
@@ -276,9 +276,9 @@ def normalize_memory_decision(parsed_data):
     action = str(decision_data.get("action", "skip")).strip().lower()
     if action not in {"add", "skip"}:
         action = "skip"
-    title = to_ascii_text(decision_data.get("title", ""), "user_info")
-    content = to_ascii_text(decision_data.get("content", ""), "user_profile_update")
-    reason = to_ascii_text(decision_data.get("reason", ""), "useful")
+    title = to_stored_field(decision_data.get("title", ""), "user_info", 40)
+    content = to_stored_field(decision_data.get("content", ""), "user_profile_update", 120)
+    reason = to_stored_field(decision_data.get("reason", ""), "useful", 40)
 
     tags_raw = decision_data.get("tags", [])
     tags = []
@@ -352,16 +352,16 @@ def decide_memory_with_ollama(model, user_message, answer, session_id=None, flow
         "- Pure greetings, thanks, or filler with no new fact.\n"
         "- One-off task details that will not matter in future chats.\n"
         "- Assistant-only procedural text with nothing new about the user.\n\n"
-        "If the user mixes Korean (or other non-English) with facts, still choose add when there is "
-        "a storable fact; put title/content in English ASCII: romanize or translate the fact "
-        '(e.g. name "Choi Dahoon" or "user_name_choi_dahoon"), never leave Hangul in JSON values.\n\n'
+        "If the user states facts in Korean (or other non-English), still use action=add; put the fact in "
+        "title/content in the same language as the user when that preserves meaning best (Korean in Korean, etc.). "
+        "Tags stay short Latin snake_case (name, profile, spouse, work, …).\n\n"
         "Field limits (stay compact but informative):\n"
-        "- title: <= 40 chars, short label (e.g. user_name, work, locale).\n"
+        "- title: <= 40 chars, short label (e.g. user_name, work, or Korean label).\n"
         "- content: <= 120 chars, one clear fact the system can retrieve later.\n"
         "- tags: <= 5 short snake_case tokens (name, profile, preference, locale, work, etc.).\n"
         "- reason: <= 40 chars, why add/skip (for add: fact type; for skip: smalltalk/oneoff/etc).\n"
         "- If skip: empty title, content, tags; reason only.\n\n"
-        "All output values MUST be English ASCII only.\n\n"
+        "JSON must be valid UTF-8; no control characters in strings.\n\n"
         f"USER: {trimmed_user_message}\n"
         f"ASSISTANT: {trimmed_answer}\n"
     )
