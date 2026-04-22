@@ -1,0 +1,1003 @@
+"""
+채팅 처리 핵심 서비스.
+세션 히스토리, 메모리 저장, Ollama 호출, 스트리밍 응답을 담당한다.
+"""
+
+import json
+import os
+import re
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
+from queue import Queue
+from time import perf_counter
+from urllib import error, request
+
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
+
+from config import settings
+from hermes.service import hermes_service
+
+chat_sessions = {}
+max_session_turns = 20
+stream_headers = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+korean_timezone = timezone(timedelta(hours=9))
+memory_task_queue = Queue()
+memory_worker_started = False
+memory_worker_lock = threading.Lock()
+memory_schedule_lock = threading.Lock()
+session_last_memory_schedule_time = {}
+
+
+# 채팅 세션 히스토리로 최종 프롬프트를 만든다.
+def build_session_prompt(history, current_message):
+    prompt_max_turns = settings.chat_prompt_max_turns
+    if prompt_max_turns > 0 and len(history) > prompt_max_turns * 2:
+        history = history[-(prompt_max_turns * 2) :]
+
+    prompt_lines = []
+    for history_item in history:
+        role = history_item.get("role", "user").upper()
+        content = history_item.get("content", "")
+        if content:
+            prompt_lines.append(f"{role}: {content}")
+
+    prompt_lines.append(f"USER: {current_message}")
+    prompt_lines.append("ASSISTANT:")
+    return "\n".join(prompt_lines)
+
+
+# 채팅 진단 로그를 파일에 남긴다. event는 사람이 읽기 쉬운 한글 문자열을 쓴다.
+def write_chat_log(event, payload):
+    if not settings.chat_log_enabled:
+        return
+    try:
+        log_file_path = settings.chat_log_path
+        log_directory = os.path.dirname(log_file_path)
+        if log_directory:
+            os.makedirs(log_directory, exist_ok=True)
+        log_time = datetime.now(korean_timezone).strftime("%Y.%m.%d %H:%M:%S")
+        row = {"event": event, "payload": payload}
+        with open(log_file_path, "a", encoding="utf-8") as file_pointer:
+            file_pointer.write(f"[{log_time}] {json.dumps(row, ensure_ascii=False)}\n\n")
+    except Exception:
+        # 로그 실패가 채팅 기능을 막지 않도록 무시한다.
+        return
+
+
+# keep_alive 로그 표기를 사람이 읽기 쉽게 맞춘다.
+def normalize_keep_alive_for_log(value):
+    text_value = str(value or "").strip()
+    if not text_value:
+        return ""
+    if text_value.endswith("h") and text_value[:-1].isdigit():
+        return text_value[:-1]
+    return text_value
+
+
+# Ollama 요청 로그에 필요한 필드만 추려서 만든다.
+def build_log_prompt_fields(payload):
+    return {
+        "prompt": str(payload.get("prompt", "")),
+        "stream": bool(payload.get("stream", False)),
+        "system": str(payload.get("system", "")),
+        "keep_alive": normalize_keep_alive_for_log(payload.get("keep_alive")),
+    }
+
+
+# 채팅 플로우 단계 로그를 통일된 형식으로 기록한다. step_name은 event로 그대로 쓰이므로 한글로 넘긴다.
+def log_chat_flow(session_id, flow_id, step_name, data=None):
+    write_chat_log(
+        step_name,
+        {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "data": data or {},
+        },
+    )
+
+
+# 백그라운드 메모리 저장 워커를 실행한다.
+def memory_worker_loop():
+    while True:
+        task = memory_task_queue.get()
+        try:
+            maybe_store_global_memory(
+                session_id=str(task.get("session_id", "")),
+                user_message=str(task.get("user_message", "")),
+                answer=str(task.get("answer", "")),
+                model=str(task.get("model", "")),
+                flow_id=str(task.get("flow_id", "")),
+            )
+        except Exception as exception:
+            write_chat_log("메모리 워커 오류", {"error": str(exception), "task": task})
+        finally:
+            memory_task_queue.task_done()
+
+
+# 메모리 저장 워커를 1회만 시작한다.
+def ensure_memory_worker():
+    global memory_worker_started
+    if memory_worker_started:
+        return
+    with memory_worker_lock:
+        if memory_worker_started:
+            return
+        worker_thread = threading.Thread(target=memory_worker_loop, daemon=True)
+        worker_thread.start()
+        memory_worker_started = True
+        write_chat_log("메모리 워커 기동", {})
+
+
+# Hermes 글로벌 메모리를 조회한다.
+def fetch_hermes_memory(limit, session_id=None, flow_id=None):
+    write_chat_log(
+        "hermes 조회 요청",
+        {"limit": limit, "session_id": session_id, "flow_id": flow_id},
+    )
+    memory_rows = hermes_service.list_memory(limit=limit)
+    write_chat_log(
+        "hermes 조회 응답",
+        {"limit": limit, "count": len(memory_rows), "session_id": session_id, "flow_id": flow_id},
+    )
+    return memory_rows
+
+
+# Hermes 글로벌 메모리에 새 항목을 저장한다.
+def save_hermes_memory(title, content, tags, source, session_id, user_message, flow_id=None):
+    write_chat_log(
+        "hermes 저장 요청",
+        {
+            "title": title,
+            "content_preview": content[:200],
+            "tags": tags,
+            "source": source,
+            "session_id": session_id,
+            "flow_id": flow_id,
+        },
+    )
+    memory_row = hermes_service.add_memory(
+        title=title,
+        content=content,
+        tags=tags,
+        source=source,
+        session_id=session_id,
+        user_message=user_message,
+    )
+    write_chat_log(
+        "hermes 저장 응답",
+        {
+            "memory_id": memory_row.get("memory_id"),
+            "title": memory_row.get("title"),
+            "session_id": session_id,
+            "flow_id": flow_id,
+        },
+    )
+    return memory_row
+
+
+# 프롬프트에 붙일 Hermes 메모리 컨텍스트 문자열을 만든다.
+def build_memory_context(session_id=None, flow_id=None):
+    memory_rows = fetch_hermes_memory(
+        limit=settings.chat_first_scan_results,
+        session_id=session_id,
+        flow_id=flow_id,
+    )
+    if not memory_rows:
+        write_chat_log(
+            "프롬프트 메모리 문맥",
+            {"session_id": session_id, "flow_id": flow_id, "applied": False, "count": 0},
+        )
+        return ""
+
+    context_lines = ["[HERMES_GLOBAL_MEMORY_CONTEXT]"]
+    for row_index, memory_row in enumerate(memory_rows, start=1):
+        title = memory_row.get("title", "").strip()
+        content = memory_row.get("content", "").strip()
+        if not content:
+            continue
+        prefix = f"{row_index}. {title} - " if title else f"{row_index}. "
+        context_lines.append(f"{prefix}{content}")
+
+    if len(context_lines) == 1:
+        write_chat_log(
+            "프롬프트 메모리 문맥",
+            {"session_id": session_id, "flow_id": flow_id, "applied": False, "count": 0},
+        )
+        return ""
+
+    context_lines.append("[END_HERMES_GLOBAL_MEMORY_CONTEXT]")
+    write_chat_log(
+        "프롬프트 메모리 문맥",
+        {"session_id": session_id, "flow_id": flow_id, "applied": True, "count": max(len(context_lines) - 2, 0)},
+    )
+    return "\n".join(context_lines)
+
+
+# 문자열에서 JSON 객체를 안전하게 추출한다.
+def extract_json_object(raw_text):
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    first_brace_index = text.find("{")
+    last_brace_index = text.rfind("}")
+    if first_brace_index == -1 or last_brace_index == -1 or last_brace_index <= first_brace_index:
+        return None
+    try:
+        data = json.loads(text[first_brace_index : last_brace_index + 1])
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+# 메모리 저장 의사결정 결과를 안전한 값으로 정규화한다.
+def normalize_memory_decision(parsed_data):
+    def to_ascii_text(value, fallback):
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        ascii_text = text.encode("ascii", "ignore").decode("ascii").strip()
+        if not ascii_text:
+            return fallback
+        ascii_text = re.sub(r"\s+", " ", ascii_text)
+        return ascii_text[:120]
+
+    def to_ascii_tag(value):
+        text = str(value or "").strip()
+        tag_map = {
+            "직업": "job",
+            "회사": "company",
+            "이름": "name",
+            "사용자 정보": "user_profile",
+            "개인 정보": "personal_info",
+            "职业信息": "job_info",
+        }
+        if text in tag_map:
+            return tag_map[text]
+        ascii_text = text.encode("ascii", "ignore").decode("ascii").lower()
+        ascii_text = re.sub(r"[^a-z0-9]+", "_", ascii_text).strip("_")
+        return ascii_text[:24] if ascii_text else ""
+
+    decision_data = parsed_data or {}
+    action = str(decision_data.get("action", "skip")).strip().lower()
+    if action not in {"add", "skip"}:
+        action = "skip"
+    title = to_ascii_text(decision_data.get("title", ""), "user_info")
+    content = to_ascii_text(decision_data.get("content", ""), "user_profile_update")
+    reason = to_ascii_text(decision_data.get("reason", ""), "useful")
+
+    tags_raw = decision_data.get("tags", [])
+    tags = []
+    if isinstance(tags_raw, list):
+        tags = [tag for item in tags_raw if (tag := to_ascii_tag(item))]
+
+    return {
+        "action": action,
+        "title": title,
+        "content": content,
+        "tags": tags[:5],
+        "reason": reason,
+    }
+
+
+# 저장하려는 메모리가 기존 메모리와 중복되는지 확인한다.
+def is_duplicate_memory(text, session_id=None, flow_id=None):
+    normalized_text = text.strip().lower()
+    if not normalized_text:
+        return True
+    existing_rows = fetch_hermes_memory(limit=100, session_id=session_id, flow_id=flow_id)
+    for existing_row in existing_rows:
+        existing_content = str(existing_row.get("content", "")).strip().lower()
+        if existing_content and (existing_content in normalized_text or normalized_text in existing_content):
+            return True
+    return False
+
+
+# 메모리 의사결정 요청 텍스트를 최대 길이로 잘라낸다.
+def trim_for_memory_decision(text, max_chars):
+    normalized_text = (text or "").strip()
+    if max_chars <= 0 or len(normalized_text) <= max_chars:
+        return normalized_text
+    return f"{normalized_text[:max_chars].rstrip()}..."
+
+
+# 짧은 소통은 메모리 저장 의사결정을 생략한다.
+def should_skip_memory_decision(user_message, answer):
+    user_message_trimmed = (user_message or "").strip()
+    answer_trimmed = (answer or "").strip()
+    if not user_message_trimmed or not answer_trimmed:
+        return "empty_text"
+
+    if (
+        "?" in user_message_trimmed
+        and len(user_message_trimmed) <= settings.chat_memory_skip_short_question_len
+        and len(answer_trimmed) <= settings.chat_memory_decision_max_chars
+    ):
+        return "short_question"
+    return None
+
+
+# Ollama를 사용해 메모리 저장 여부를 결정한다.
+def decide_memory_with_ollama(model, user_message, answer, session_id=None, flow_id=None):
+    max_chars = settings.chat_memory_decision_max_chars
+    trimmed_user_message = trim_for_memory_decision(user_message, max_chars)
+    trimmed_answer = trim_for_memory_decision(answer, max_chars)
+    decision_prompt = (
+        "Return ONLY compact JSON on one line:\n"
+        '{"action":"add|skip","title":"","content":"","tags":[],"reason":""}\n'
+        "You are deciding what to store so the assistant can remember this user long-term "
+        "(name, preferences, constraints, recurring context). Prefer saving durable personal facts.\n\n"
+        "When to use action=add:\n"
+        "- Identity: name, how they introduce themselves in ANY language (e.g. Korean like "
+        '"나는 …이야/예요", real name, nickname, pronouns, role).\n'
+        "- Profile: job, workplace, skills, city/timezone, languages, family or pets they mention, "
+        "health or diet only if they clearly state it as a fact about themselves.\n"
+        "- Preferences: communication style, tools, goals, standing rules (\"always…\", \"never…\").\n"
+        "- Stable facts they want remembered, not questions the assistant only answered once.\n\n"
+        "When to use action=skip:\n"
+        "- Pure greetings, thanks, or filler with no new fact.\n"
+        "- One-off task details that will not matter in future chats.\n"
+        "- Assistant-only procedural text with nothing new about the user.\n\n"
+        "If the user mixes Korean (or other non-English) with facts, still choose add when there is "
+        "a storable fact; put title/content in English ASCII: romanize or translate the fact "
+        '(e.g. name "Choi Dahoon" or "user_name_choi_dahoon"), never leave Hangul in JSON values.\n\n'
+        "Field limits (stay compact but informative):\n"
+        "- title: <= 40 chars, short label (e.g. user_name, work, locale).\n"
+        "- content: <= 120 chars, one clear fact the system can retrieve later.\n"
+        "- tags: <= 5 short snake_case tokens (name, profile, preference, locale, work, etc.).\n"
+        "- reason: <= 40 chars, why add/skip (for add: fact type; for skip: smalltalk/oneoff/etc).\n"
+        "- If skip: empty title, content, tags; reason only.\n\n"
+        "All output values MUST be English ASCII only.\n\n"
+        f"USER: {trimmed_user_message}\n"
+        f"ASSISTANT: {trimmed_answer}\n"
+    )
+    ollama_url = f"{settings.ollama_base_url}/api/generate"
+    payload = {
+        "model": model,
+        "prompt": decision_prompt,
+        "stream": False,
+        "keep_alive": settings.ollama_keep_alive,
+        "options": {
+            "temperature": 0,
+            "num_predict": settings.chat_memory_decision_num_predict,
+        },
+    }
+    write_chat_log(
+        "저장 판단 API 요청",
+        {
+            "model": model,
+            "payload": payload,
+            "user_message": user_message,
+            "session_id": session_id,
+            "flow_id": flow_id,
+        },
+    )
+    http_request = request.Request(
+        url=ollama_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started_time = perf_counter()
+    timeout_seconds = settings.chat_memory_decision_timeout_seconds
+    if timeout_seconds <= 0:
+        timeout_seconds = settings.ollama_timeout_seconds
+    with request.urlopen(http_request, timeout=timeout_seconds) as response:
+        response_body = json.loads(response.read().decode("utf-8"))
+    latency_milliseconds = int((perf_counter() - started_time) * 1000)
+    raw_response_text = str(response_body.get("response", "")).strip()
+    parsed_decision = normalize_memory_decision(extract_json_object(raw_response_text))
+
+    write_chat_log(
+        "저장 판단 API 응답",
+        {
+            "model": model,
+            "raw_response": raw_response_text,
+            "parsed": parsed_decision,
+            "latency_ms": latency_milliseconds,
+            "truncated": {
+                "user_message": trimmed_user_message != user_message.strip(),
+                "assistant_answer": trimmed_answer != answer.strip(),
+                "max_chars": max_chars,
+            },
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "timeout_seconds": timeout_seconds,
+        },
+    )
+    return parsed_decision
+
+
+# 응답 완료 후 메모리 저장 파이프라인을 실행한다.
+def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=None):
+    if settings.chat_memory_decision_mode.lower() != "ollama":
+        write_chat_log(
+            "메모리 저장 생략",
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "reason": "decision_mode_off",
+                "mode": settings.chat_memory_decision_mode,
+            },
+        )
+        return
+    if not answer.strip():
+        write_chat_log(
+            "메모리 저장 생략",
+            {"session_id": session_id, "flow_id": flow_id, "reason": "empty_answer"},
+        )
+        return
+    skip_reason = should_skip_memory_decision(user_message=user_message, answer=answer)
+    if skip_reason:
+        write_chat_log(
+            "메모리 저장 생략",
+            {"session_id": session_id, "flow_id": flow_id, "reason": skip_reason},
+        )
+        return
+
+    decision_model = settings.chat_memory_decision_model or model
+    try:
+        log_chat_flow(
+            session_id,
+            flow_id or "n/a",
+            "메모리 판단 시작",
+            {"model": decision_model},
+        )
+        decision = decide_memory_with_ollama(
+            model=decision_model,
+            user_message=user_message,
+            answer=answer,
+            session_id=session_id,
+            flow_id=flow_id,
+        )
+    except Exception as exception:
+        write_chat_log(
+            "메모리 저장 생략",
+            {"session_id": session_id, "flow_id": flow_id, "reason": "decision_error", "error": str(exception)},
+        )
+        return
+
+    log_chat_flow(
+        session_id,
+        flow_id or "n/a",
+        "메모리 판단 끝",
+        {
+            "action": decision.get("action", "skip"),
+            "reason": decision.get("reason", ""),
+            "title": decision.get("title", ""),
+        },
+    )
+    write_chat_log(
+        "memory_decision_result",
+        {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "action": decision.get("action", "skip"),
+            "reason": decision.get("reason", ""),
+            "title": decision.get("title", ""),
+            "tags": decision.get("tags", []),
+            "user_message": user_message,
+            "assistant_answer": answer,
+        },
+    )
+
+    if decision["action"] != "add":
+        write_chat_log(
+            "메모리 저장 생략",
+            {"session_id": session_id, "flow_id": flow_id, "reason": "decision_skip", "decision": decision},
+        )
+        return
+
+    content = decision["content"] or f"{user_message}\n{answer}"
+    if is_duplicate_memory(content, session_id=session_id, flow_id=flow_id):
+        write_chat_log(
+            "메모리 저장 생략",
+            {"session_id": session_id, "flow_id": flow_id, "reason": "duplicate", "content_preview": content[:200]},
+        )
+        return
+
+    title = decision["title"] or user_message.strip().replace("\n", " ")[:50] or "chat_memory"
+    log_chat_flow(session_id, flow_id or "n/a", "메모리 저장 시작", {"title": title})
+    memory_row = save_hermes_memory(
+        title=title,
+        content=content,
+        tags=decision["tags"],
+        source="chat_auto",
+        session_id=session_id,
+        user_message=user_message,
+        flow_id=flow_id,
+    )
+    write_chat_log(
+        "memory_store_add",
+        {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "decision": decision,
+            "memory_id": memory_row.get("memory_id"),
+            "title": title,
+        },
+    )
+    log_chat_flow(
+        session_id,
+        flow_id or "n/a",
+        "메모리 저장 끝",
+        {"memory_id": memory_row.get("memory_id")},
+    )
+
+
+# 메모리 저장 작업을 큐에 안전하게 등록한다.
+def schedule_memory_store(session_id, user_message, answer, model, flow_id=None):
+    ensure_memory_worker()
+    cooldown_seconds = settings.chat_memory_session_cooldown_seconds
+    now = perf_counter()
+    if cooldown_seconds > 0:
+        with memory_schedule_lock:
+            last_scheduled_time = session_last_memory_schedule_time.get(session_id)
+            if last_scheduled_time is not None and (now - last_scheduled_time) < cooldown_seconds:
+                remaining_milliseconds = int((cooldown_seconds - (now - last_scheduled_time)) * 1000)
+                write_chat_log(
+                    "메모리 저장 생략",
+                    {
+                        "session_id": session_id,
+                        "flow_id": flow_id,
+                        "reason": "session_cooldown",
+                        "cooldown_seconds": cooldown_seconds,
+                        "remaining_ms": max(remaining_milliseconds, 0),
+                    },
+                )
+                return
+            session_last_memory_schedule_time[session_id] = now
+
+    task = {
+        "session_id": session_id,
+        "flow_id": flow_id or "",
+        "model": model,
+        "user_message": user_message,
+        "answer": answer,
+    }
+    write_chat_log(
+        "memory_store_scheduled",
+        {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "model": model,
+            "user_message": user_message,
+            "queue_size_before": memory_task_queue.qsize(),
+        },
+    )
+    memory_task_queue.put(task)
+    write_chat_log(
+        "memory_store_enqueued",
+        {"session_id": session_id, "flow_id": flow_id, "queue_size_after": memory_task_queue.qsize()},
+    )
+
+
+# 중복 생성된 답변 텍스트를 정규화한다.
+def normalize_answer_text(answer):
+    text = (answer or "").strip()
+    if not text:
+        return ""
+
+    half_length = len(text) // 2
+    if len(text) % 2 == 0 and half_length >= 10 and text[:half_length] == text[half_length:]:
+        return text[:half_length].strip()
+
+    lines = text.splitlines()
+    line_half_length = len(lines) // 2
+    if len(lines) % 2 == 0 and line_half_length >= 1 and lines[:line_half_length] == lines[line_half_length:]:
+        return "\n".join(lines[:line_half_length]).strip()
+
+    return text
+
+
+# Ollama 스트리밍 응답을 SSE 이벤트로 변환한다.
+def chat_stream(url, payload, on_complete=None, log_context=None):
+    flow_id = str((log_context or {}).get("flow_id", "n/a"))
+    session_id = str((log_context or {}).get("session_id", "n/a"))
+    started_time = perf_counter()
+    first_token_latency_ms = None
+    done_received_latency_ms = None
+    on_complete_latency_ms = None
+    chunk_count = 0
+    log_chat_flow(session_id, flow_id, "LLM 호출 시작", {"stream": True})
+    write_chat_log(
+        "chat_http_request",
+        {
+            **(log_context or {}),
+            "url": url,
+            **build_log_prompt_fields(payload),
+        },
+    )
+    http_request = request.Request(
+        url=url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    answer_parts = []
+    done_sent = False
+    try:
+        with request.urlopen(http_request, timeout=settings.ollama_timeout_seconds) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                piece = data.get("response", "")
+                if piece:
+                    chunk_count += 1
+                    if first_token_latency_ms is None:
+                        first_token_latency_ms = int((perf_counter() - started_time) * 1000)
+                        write_chat_log(
+                            "chat_stream_first_token",
+                            {
+                                **(log_context or {}),
+                                "latency_ms": first_token_latency_ms,
+                            },
+                        )
+                    answer_parts.append(piece)
+                    for character in piece:
+                        yield f"data: {json.dumps({'text': character}, ensure_ascii=False)}\n\n"
+
+                if data.get("done"):
+                    done_received_latency_ms = int((perf_counter() - started_time) * 1000)
+                    final_answer = normalize_answer_text("".join(answer_parts))
+                    if on_complete:
+                        on_complete_started_time = perf_counter()
+                        on_complete(final_answer)
+                        on_complete_latency_ms = int((perf_counter() - on_complete_started_time) * 1000)
+                    total_latency_ms = int((perf_counter() - started_time) * 1000)
+                    write_chat_log(
+                        "chat_http_response",
+                        {
+                            **(log_context or {}),
+                            "stream": True,
+                            "answer": final_answer,
+                        },
+                    )
+                    write_chat_log(
+                        "chat_stream_timing",
+                        {
+                            **(log_context or {}),
+                            "total_latency_ms": total_latency_ms,
+                            "first_token_latency_ms": first_token_latency_ms,
+                            "done_received_latency_ms": done_received_latency_ms,
+                            "on_complete_latency_ms": on_complete_latency_ms,
+                            "chunk_count": chunk_count,
+                            "answer_chars": len(final_answer),
+                        },
+                    )
+                    write_chat_log(
+                        "chat_stream_phase_breakdown",
+                        {
+                            **(log_context or {}),
+                            "prefill_ms": first_token_latency_ms,
+                            "answer_generation_ms": (
+                                done_received_latency_ms - first_token_latency_ms
+                                if first_token_latency_ms is not None and done_received_latency_ms is not None
+                                else None
+                            ),
+                            "postprocess_ms": (
+                                total_latency_ms - done_received_latency_ms
+                                if done_received_latency_ms is not None
+                                else None
+                            ),
+                        },
+                    )
+                    log_chat_flow(session_id, flow_id, "LLM 응답 완료", {"stream": True})
+                    yield "event: done\ndata: [DONE]\n\n"
+                    done_sent = True
+                    break
+
+            if not done_sent:
+                done_received_latency_ms = int((perf_counter() - started_time) * 1000)
+                final_answer = normalize_answer_text("".join(answer_parts))
+                if on_complete:
+                    on_complete_started_time = perf_counter()
+                    on_complete(final_answer)
+                    on_complete_latency_ms = int((perf_counter() - on_complete_started_time) * 1000)
+                total_latency_ms = int((perf_counter() - started_time) * 1000)
+                write_chat_log(
+                    "chat_stream_done_fallback",
+                    {
+                        **(log_context or {}),
+                        "reason": "upstream_closed_without_done",
+                        "answer": final_answer,
+                    },
+                )
+                write_chat_log(
+                    "chat_stream_timing",
+                    {
+                        **(log_context or {}),
+                        "total_latency_ms": total_latency_ms,
+                        "first_token_latency_ms": first_token_latency_ms,
+                        "done_received_latency_ms": done_received_latency_ms,
+                        "on_complete_latency_ms": on_complete_latency_ms,
+                        "chunk_count": chunk_count,
+                        "answer_chars": len(final_answer),
+                        "fallback": "upstream_closed_without_done",
+                    },
+                )
+                write_chat_log(
+                    "chat_stream_phase_breakdown",
+                    {
+                        **(log_context or {}),
+                        "prefill_ms": first_token_latency_ms,
+                        "answer_generation_ms": (
+                            done_received_latency_ms - first_token_latency_ms
+                            if first_token_latency_ms is not None and done_received_latency_ms is not None
+                            else None
+                        ),
+                        "postprocess_ms": (
+                            total_latency_ms - done_received_latency_ms
+                            if done_received_latency_ms is not None
+                            else None
+                        ),
+                        "fallback": "upstream_closed_without_done",
+                    },
+                )
+                log_chat_flow(
+                    session_id,
+                    flow_id,
+                    "LLM 응답 완료",
+                    {"stream": True, "fallback": "upstream_closed_without_done"},
+                )
+                yield "event: done\ndata: [DONE]\n\n"
+                done_sent = True
+    except Exception as exception:
+        write_chat_log(
+            "chat_http_error",
+            {**(log_context or {}), "stream": True, "error": str(exception)},
+        )
+        log_chat_flow(session_id, flow_id, "LLM 응답 오류", {"stream": True, "error": str(exception)})
+        yield f"event: error\ndata: {json.dumps({'error': str(exception)}, ensure_ascii=False)}\n\n"
+    finally:
+        if not done_sent:
+            write_chat_log(
+                "chat_stream_done_fallback",
+                {**(log_context or {}), "reason": "finally_guard"},
+            )
+            log_chat_flow(
+                session_id,
+                flow_id,
+                "LLM 응답 완료",
+                {"stream": True, "fallback": "finally_guard"},
+            )
+            write_chat_log(
+                "chat_stream_timing",
+                {
+                    **(log_context or {}),
+                    "total_latency_ms": int((perf_counter() - started_time) * 1000),
+                    "first_token_latency_ms": first_token_latency_ms,
+                    "done_received_latency_ms": done_received_latency_ms,
+                    "on_complete_latency_ms": on_complete_latency_ms,
+                    "chunk_count": chunk_count,
+                    "fallback": "finally_guard",
+                },
+            )
+            yield "event: done\ndata: [DONE]\n\n"
+
+
+# 요청 헤더에서 클라이언트 메타 정보를 추출한다.
+def client_meta(request_info):
+    return {
+        "client": request_info.headers.get("x-dabo-client", "unknown"),
+        "build": request_info.headers.get("x-dabo-build", "unknown"),
+        "api_version": request_info.headers.get("x-api-version", "unknown"),
+    }
+
+
+# 단일 채팅 턴을 세션 히스토리에 저장한다.
+def save_chat_turn(session_id, user_message, answer, model_name, flow_id):
+    normalized_answer = normalize_answer_text(answer)
+    turns = chat_sessions.setdefault(session_id, [])
+    if len(turns) >= 2:
+        last_user_turn = turns[-2]
+        last_assistant_turn = turns[-1]
+        if (
+            last_user_turn.get("role") == "user"
+            and last_assistant_turn.get("role") == "assistant"
+            and last_user_turn.get("content") == user_message
+            and last_assistant_turn.get("content") == normalized_answer
+        ):
+            return
+
+    turns.append({"role": "user", "content": user_message})
+    turns.append({"role": "assistant", "content": normalized_answer})
+    if len(turns) > max_session_turns * 2:
+        chat_sessions[session_id] = turns[-(max_session_turns * 2) :]
+
+    schedule_memory_store(
+        session_id=session_id,
+        user_message=user_message,
+        answer=normalized_answer,
+        model=model_name,
+        flow_id=flow_id,
+    )
+
+
+# 채팅 요청 1건을 처리하고 일반/스트리밍 응답을 반환한다.
+def process_chat_request(chat_request, request_info):
+    session_id = chat_request.session_id or str(uuid.uuid4())
+    flow_id = uuid.uuid4().hex[:12]
+    log_chat_flow(
+        session_id,
+        flow_id,
+        "요청 수신",
+        {"new_chat": chat_request.new_chat, "stream": chat_request.stream},
+    )
+    if chat_request.new_chat:
+        chat_sessions.pop(session_id, None)
+
+    history = chat_sessions.get(session_id, [])
+    log_chat_flow(
+        session_id,
+        flow_id,
+        "세션 히스토리 로드",
+        {"history_turns": len(history) // 2, "prompt_max_turns": settings.chat_prompt_max_turns},
+    )
+    prompt = build_session_prompt(history, chat_request.message)
+
+    log_chat_flow(session_id, flow_id, "Hermes 메모리 조회 시작")
+    use_memory_context = True
+    if settings.chat_memory_context_first_turn_only and len(history) > 0:
+        use_memory_context = False
+    memory_context = build_memory_context(session_id=session_id, flow_id=flow_id) if use_memory_context else ""
+    if memory_context:
+        prompt = f"{memory_context}\n\n{prompt}"
+    log_chat_flow(
+        session_id,
+        flow_id,
+        "Hermes 메모리 조회 끝",
+        {
+            "memory_context_applied": bool(memory_context),
+            "memory_context_first_turn_only": settings.chat_memory_context_first_turn_only,
+        },
+    )
+    write_chat_log(
+        "chat_prompt_ready",
+        {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "history_turns": len(history) // 2,
+            "memory_context_applied": bool(memory_context),
+            "prompt_chars": len(prompt),
+        },
+    )
+
+    ollama_url = f"{settings.ollama_base_url}/api/generate"
+    payload = {
+        "model": chat_request.model or settings.ollama_model,
+        "prompt": prompt,
+        "stream": chat_request.stream,
+    }
+    system_prompt = chat_request.system_prompt or settings.default_system_prompt
+    if system_prompt:
+        payload["system"] = system_prompt
+    if chat_request.think is not None:
+        payload["think"] = chat_request.think
+    keep_alive = chat_request.keep_alive or settings.ollama_keep_alive
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
+
+    client = client_meta(request_info)
+    model_name = str(payload["model"])
+
+    if chat_request.stream:
+        def on_complete(answer):
+            save_chat_turn(
+                session_id=session_id,
+                user_message=chat_request.message,
+                answer=answer,
+                model_name=model_name,
+                flow_id=flow_id,
+            )
+
+        return StreamingResponse(
+            chat_stream(
+                ollama_url,
+                payload,
+                on_complete=on_complete,
+                log_context={"session_id": session_id, "model": model_name, "flow_id": flow_id},
+            ),
+            media_type="text/event-stream; charset=utf-8",
+            headers={
+                **stream_headers,
+                "X-DABO-Client": client["client"],
+                "X-DABO-Build": client["build"],
+                "X-API-Version": client["api_version"],
+                "X-Session-Id": session_id,
+            },
+        )
+
+    try:
+        log_chat_flow(session_id, flow_id, "LLM 호출 시작", {"stream": False})
+        write_chat_log(
+            "chat_http_request",
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "url": ollama_url,
+                **build_log_prompt_fields(payload),
+            },
+        )
+        http_request = request.Request(
+            url=ollama_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with request.urlopen(http_request, timeout=settings.ollama_timeout_seconds) as response:
+            response_body = json.loads(response.read().decode("utf-8"))
+        answer = normalize_answer_text(response_body.get("response", ""))
+        write_chat_log(
+            "chat_http_response",
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "stream": False,
+                "answer": answer,
+                "raw_body": response_body,
+            },
+        )
+        log_chat_flow(session_id, flow_id, "LLM 응답 완료", {"stream": False})
+        save_chat_turn(
+            session_id=session_id,
+            user_message=chat_request.message,
+            answer=answer,
+            model_name=model_name,
+            flow_id=flow_id,
+        )
+        log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "ok"})
+        return {
+            "answer": answer,
+            "model": payload["model"],
+            "client": client,
+            "session_id": session_id,
+        }
+    except error.URLError as exception:
+        write_chat_log(
+            "chat_http_error",
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "stream": False,
+                "error": str(exception),
+            },
+        )
+        log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "error", "error": str(exception)})
+        raise HTTPException(status_code=502, detail=f"Ollama connection failed: {exception}") from exception
+    except Exception as exception:
+        write_chat_log(
+            "chat_http_error",
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "stream": False,
+                "error": str(exception),
+            },
+        )
+        log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "error", "error": str(exception)})
+        raise HTTPException(status_code=500, detail=f"Chat error: {exception}") from exception
