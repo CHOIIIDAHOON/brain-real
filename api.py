@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -287,17 +288,43 @@ def _build_memory_decision_instruction() -> str:
 
 
 def _normalize_memory_decision(parsed: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _to_ascii_text(value: Any, fallback: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        ascii_text = text.encode("ascii", "ignore").decode("ascii").strip()
+        if not ascii_text:
+            return fallback
+        ascii_text = re.sub(r"\s+", " ", ascii_text)
+        return ascii_text[:120]
+
+    def _to_ascii_tag(value: Any) -> str:
+        text = str(value or "").strip()
+        tag_map = {
+            "직업": "job",
+            "회사": "company",
+            "이름": "name",
+            "사용자 정보": "user_profile",
+            "개인 정보": "personal_info",
+            "职业信息": "job_info",
+        }
+        if text in tag_map:
+            return tag_map[text]
+        ascii_text = text.encode("ascii", "ignore").decode("ascii").lower()
+        ascii_text = re.sub(r"[^a-z0-9]+", "_", ascii_text).strip("_")
+        return ascii_text[:24] if ascii_text else ""
+
     data = parsed or {}
     action = str(data.get("action", "skip")).strip().lower()
     if action not in {"add", "skip"}:
         action = "skip"
-    title = str(data.get("title", "")).strip()
-    content = str(data.get("content", "")).strip()
-    reason = str(data.get("reason", "")).strip()
+    title = _to_ascii_text(data.get("title", ""), "user_info")
+    content = _to_ascii_text(data.get("content", ""), "user_profile_update")
+    reason = _to_ascii_text(data.get("reason", ""), "useful")
     tags_raw = data.get("tags", [])
     tags: List[str] = []
     if isinstance(tags_raw, list):
-        tags = [str(item).strip() for item in tags_raw if str(item).strip()]
+        tags = [tag for item in tags_raw if (tag := _to_ascii_tag(item))]
     return {
         "action": action,
         "title": title,
@@ -450,6 +477,7 @@ def _decide_memory_with_ollama(
         "Keep all fields VERY SHORT:\n"
         '- title <= 8 chars, content <= 20 chars, tags <= 2 items, reason <= 12 chars.\n'
         '- If skip, use empty title/content/tags and short reason code (smalltalk/profile_missing/oneoff/etc).\n\n'
+        "All output values MUST be English ASCII only.\n\n"
         f"USER: {user_message_trimmed}\n"
         f"ASSISTANT: {answer_trimmed}\n"
     )
