@@ -654,8 +654,9 @@ def chat_stream(url, payload, on_complete=None, log_context=None):
                             },
                         )
                     answer_parts.append(piece)
-                    for character in piece:
-                        yield f"data: {json.dumps({'text': character}, ensure_ascii=False)}\n\n"
+                    # Ollama NDJSON 한 덩어리씩 보낸다. 글자 단위 SSE는 이벤트가 과도해
+                    # 클라이언트/프록시가 끊거나 GeneratorExit → finally_guard로 이어질 수 있다.
+                    yield f"data: {json.dumps({'text': piece}, ensure_ascii=False)}\n\n"
 
                 if data.get("done"):
                     done_received_latency_ms = int((perf_counter() - started_time) * 1000)
