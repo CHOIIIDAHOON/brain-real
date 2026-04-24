@@ -1,4 +1,10 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# 프로젝트 루트의 .env를 os.environ에 반영한다 (import 시점에 한 번).
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 class Settings:
