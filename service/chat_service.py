@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from queue import Queue
 from time import perf_counter
 from urllib import error, request
+from urllib.parse import urlparse
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -88,6 +89,99 @@ def build_log_prompt_fields(payload):
         "system": str(payload.get("system", "")),
         "keep_alive": normalize_keep_alive_for_log(payload.get("keep_alive")),
     }
+
+
+def ollama_request_error_fields(exception):
+    """Ollama/urllib 요청 실패를 로그에 남길 필드로 정리한다. HTTP 4xx/5xx일 때 응답 본문을 읽는다."""
+    fields = {"error": str(exception)}
+    if isinstance(exception, error.HTTPError):
+        fields["http_status"] = exception.code
+        try:
+            raw = exception.read().decode("utf-8", errors="replace")
+            if raw:
+                fields["error_body"] = raw[:8000]
+        except Exception:
+            pass
+    return fields
+
+
+def build_ollama_request_diagnostics(payload, url):
+    """Ollama /api/generate 요청 부하·용량 이슈 추적용 (CPU 스파이크·메모리와 함께 상관 분석)."""
+    prompt = str(payload.get("prompt", "") or "")
+    system = str(payload.get("system", "") or "")
+    parsed = urlparse(url)
+    try:
+        body_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        body_bytes = None
+    return {
+        "ollama_url_host": parsed.netloc or "",
+        "ollama_url_path": parsed.path or "",
+        "request_json_bytes": body_bytes,
+        "prompt_chars": len(prompt),
+        "system_chars": len(system),
+        "model": str(payload.get("model", "") or ""),
+        "stream": bool(payload.get("stream", False)),
+        "keep_alive": normalize_keep_alive_for_log(payload.get("keep_alive")),
+        "think": payload.get("think"),
+        "options": payload.get("options"),
+    }
+
+
+def ollama_packet_stats(packet):
+    """Ollama /api/generate JSON 한 줄(완료 패킷 등)의 eval/load 타이밍·토큰 수를 로그용으로 정리한다."""
+    if not isinstance(packet, dict):
+        return {}
+    out = {}
+    for key in ("model", "done_reason", "context", "prompt_eval_count", "eval_count"):
+        if key in packet and packet[key] is not None:
+            out[key] = packet[key]
+    for key in ("total_duration", "load_duration", "eval_duration", "prompt_eval_duration"):
+        value = packet.get(key)
+        if value is not None:
+            out[key + "_ms"] = int(value / 1_000_000)
+    return out
+
+
+def summarize_inter_chunk_gaps_ms(gaps):
+    if not gaps:
+        return {}
+    ordered = sorted(gaps)
+    amount = len(ordered)
+    p95_i = min(max(0, int(amount * 0.95) - 1), amount - 1)
+    return {
+        "inter_chunk_count": amount,
+        "inter_chunk_ms_min": round(min(gaps), 2),
+        "inter_chunk_ms_max": round(max(gaps), 2),
+        "inter_chunk_ms_avg": round(sum(gaps) / amount, 2),
+        "inter_chunk_ms_p95": round(ordered[p95_i], 2),
+    }
+
+
+def write_ollama_stream_diagnostics(
+    log_context,
+    chunk_gaps_ms,
+    chunk_count,
+    first_token_latency_ms,
+    done_received_latency_ms,
+    total_latency_ms,
+    ollama_metrics,
+    extra=None,
+):
+    payload = {**(log_context or {}), "stream": True}
+    payload.update(summarize_inter_chunk_gaps_ms(chunk_gaps_ms))
+    if first_token_latency_ms is not None and done_received_latency_ms is not None:
+        decode_ms = done_received_latency_ms - first_token_latency_ms
+        payload["decode_window_ms"] = decode_ms
+        if decode_ms > 0 and chunk_count:
+            payload["approx_chunk_events_per_sec"] = round(chunk_count / (decode_ms / 1000.0), 2)
+    if total_latency_ms is not None:
+        payload["client_total_ms"] = total_latency_ms
+    if ollama_metrics:
+        payload["ollama_metrics"] = ollama_metrics
+    if extra:
+        payload["extra"] = extra
+    write_chat_log("chat_ollama_stream_diagnostics", payload)
 
 
 # 채팅 플로우 단계 로그를 통일된 형식으로 기록한다. step_name은 event로 그대로 쓰이므로 한글로 넘긴다.
@@ -610,6 +704,8 @@ def chat_stream(url, payload, on_complete=None, log_context=None):
     done_received_latency_ms = None
     on_complete_latency_ms = None
     chunk_count = 0
+    chunk_gaps_ms = []
+    last_piece_at = None
     log_chat_flow(session_id, flow_id, "LLM 호출 시작", {"stream": True})
     write_chat_log(
         "chat_http_request",
@@ -617,6 +713,14 @@ def chat_stream(url, payload, on_complete=None, log_context=None):
             **(log_context or {}),
             "url": url,
             **build_log_prompt_fields(payload),
+        },
+    )
+    write_chat_log(
+        "chat_ollama_diagnostics",
+        {
+            **(log_context or {}),
+            "wall_started_at": datetime.now(korean_timezone).isoformat(),
+            **build_ollama_request_diagnostics(payload, url),
         },
     )
     http_request = request.Request(
@@ -640,9 +744,10 @@ def chat_stream(url, payload, on_complete=None, log_context=None):
 
                 piece = data.get("response", "")
                 if piece:
+                    now = perf_counter()
                     chunk_count += 1
                     if first_token_latency_ms is None:
-                        first_token_latency_ms = int((perf_counter() - started_time) * 1000)
+                        first_token_latency_ms = int((now - started_time) * 1000)
                         write_chat_log(
                             "chat_stream_first_token",
                             {
@@ -650,6 +755,9 @@ def chat_stream(url, payload, on_complete=None, log_context=None):
                                 "latency_ms": first_token_latency_ms,
                             },
                         )
+                    elif last_piece_at is not None:
+                        chunk_gaps_ms.append((now - last_piece_at) * 1000)
+                    last_piece_at = now
                     answer_parts.append(piece)
                     # Ollama NDJSON 한 덩어리씩 보낸다. 글자 단위 SSE는 이벤트가 과도해
                     # 클라이언트/프록시가 끊거나 GeneratorExit → finally_guard로 이어질 수 있다.
@@ -699,6 +807,15 @@ def chat_stream(url, payload, on_complete=None, log_context=None):
                                 else None
                             ),
                         },
+                    )
+                    write_ollama_stream_diagnostics(
+                        log_context,
+                        chunk_gaps_ms,
+                        chunk_count,
+                        first_token_latency_ms,
+                        done_received_latency_ms,
+                        total_latency_ms,
+                        ollama_packet_stats(data),
                     )
                     log_chat_flow(session_id, flow_id, "LLM 응답 완료", {"stream": True})
                     yield "event: done\ndata: [DONE]\n\n"
@@ -752,6 +869,16 @@ def chat_stream(url, payload, on_complete=None, log_context=None):
                         "fallback": "upstream_closed_without_done",
                     },
                 )
+                write_ollama_stream_diagnostics(
+                    log_context,
+                    chunk_gaps_ms,
+                    chunk_count,
+                    first_token_latency_ms,
+                    done_received_latency_ms,
+                    total_latency_ms,
+                    {},
+                    extra={"note": "upstream_closed_without_done"},
+                )
                 log_chat_flow(
                     session_id,
                     flow_id,
@@ -761,12 +888,13 @@ def chat_stream(url, payload, on_complete=None, log_context=None):
                 yield "event: done\ndata: [DONE]\n\n"
                 done_sent = True
     except Exception as exception:
-        write_chat_log(
-            "chat_http_error",
-            {**(log_context or {}), "stream": True, "error": str(exception)},
-        )
-        log_chat_flow(session_id, flow_id, "LLM 응답 오류", {"stream": True, "error": str(exception)})
-        yield f"event: error\ndata: {json.dumps({'error': str(exception)}, ensure_ascii=False)}\n\n"
+        err_fields = ollama_request_error_fields(exception)
+        write_chat_log("chat_http_error", {**(log_context or {}), "stream": True, **err_fields})
+        flow_err = {"stream": True, "error": err_fields["error"]}
+        if "http_status" in err_fields:
+            flow_err["http_status"] = err_fields["http_status"]
+        log_chat_flow(session_id, flow_id, "LLM 응답 오류", flow_err)
+        yield f"event: error\ndata: {json.dumps({'error': err_fields['error']}, ensure_ascii=False)}\n\n"
     finally:
         if not done_sent:
             write_chat_log(
@@ -790,6 +918,17 @@ def chat_stream(url, payload, on_complete=None, log_context=None):
                     "chunk_count": chunk_count,
                     "fallback": "finally_guard",
                 },
+            )
+            _fg_total = int((perf_counter() - started_time) * 1000)
+            write_ollama_stream_diagnostics(
+                log_context,
+                chunk_gaps_ms,
+                chunk_count,
+                first_token_latency_ms,
+                done_received_latency_ms,
+                _fg_total,
+                {},
+                extra={"note": "finally_guard"},
             )
             yield "event: done\ndata: [DONE]\n\n"
 
@@ -938,15 +1077,39 @@ def process_chat_request(chat_request, request_info):
                 **build_log_prompt_fields(payload),
             },
         )
+        write_chat_log(
+            "chat_ollama_diagnostics",
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "stream": False,
+                "wall_started_at": datetime.now(korean_timezone).isoformat(),
+                **build_ollama_request_diagnostics(payload, ollama_url),
+            },
+        )
         http_request = request.Request(
             url=ollama_url,
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        generate_start = perf_counter()
         with request.urlopen(http_request, timeout=settings.ollama_timeout_seconds) as response:
             response_body = json.loads(response.read().decode("utf-8"))
+        client_http_roundtrip_ms = int((perf_counter() - generate_start) * 1000)
         answer = normalize_answer_text(response_body.get("response", ""))
+        write_chat_log(
+            "chat_ollama_generate_diagnostics",
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "model": model_name,
+                "stream": False,
+                "client_http_roundtrip_ms": client_http_roundtrip_ms,
+                "ollama_metrics": ollama_packet_stats(response_body),
+            },
+        )
         write_chat_log(
             "chat_http_response",
             {
@@ -974,6 +1137,7 @@ def process_chat_request(chat_request, request_info):
             "session_id": session_id,
         }
     except error.URLError as exception:
+        err_fields = ollama_request_error_fields(exception)
         write_chat_log(
             "chat_http_error",
             {
@@ -981,11 +1145,14 @@ def process_chat_request(chat_request, request_info):
                 "flow_id": flow_id,
                 "model": model_name,
                 "stream": False,
-                "error": str(exception),
+                **err_fields,
             },
         )
-        log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "error", "error": str(exception)})
-        raise HTTPException(status_code=502, detail=f"Ollama connection failed: {exception}") from exception
+        log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "error", "error": err_fields["error"]})
+        detail = err_fields["error"]
+        if isinstance(exception, error.HTTPError):
+            raise HTTPException(status_code=502, detail=f"Ollama HTTP error: {detail}") from exception
+        raise HTTPException(status_code=502, detail=f"Ollama connection failed: {detail}") from exception
     except Exception as exception:
         write_chat_log(
             "chat_http_error",
