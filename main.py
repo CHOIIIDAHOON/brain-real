@@ -1,3 +1,4 @@
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -11,6 +12,11 @@ from hermes import hermes_router
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     if settings.chat_backend == "hermes":
+        if sys.version_info < (3, 11):
+            raise RuntimeError(
+                "CHAT_BACKEND=hermes needs Python >=3.11 (hermes-agent). "
+                "Recreate the venv with `python3.12 -m venv .venv` or set CHAT_BACKEND=ollama in .env."
+            )
         from service import hermes_chat
 
         hermes_chat.ensure_hermes_import()
