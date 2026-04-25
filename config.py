@@ -77,5 +77,26 @@ class Settings:
         }
         self.chat_log_path = os.getenv("CHAT_LOG_PATH", "./logs/chat_events.jsonl")
 
+        # ollama = 이전 직접 /api/generate, hermes = Nous Hermes Agent(AIAgent) 경유
+        self.chat_backend = os.getenv("CHAT_BACKEND", "hermes").strip().lower() or "hermes"
+        # OpenAI 클라이언트에 넘기는 키. 로컬 Ollama는 임의 비공백 값이면 된다( run_agent: api_key and base_url ).
+        self.hermes_ollama_api_key = (os.getenv("HERMES_OLLAMA_API_KEY", "not-needed") or "not-needed").strip()
+        self.hermes_max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "30"))
+        self.hermes_skip_context_files = os.getenv("HERMES_SKIP_CONTEXT_FILES", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.hermes_skip_memory = os.getenv("HERMES_SKIP_MEMORY", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        _hp = os.getenv("HERMES_PLATFORM", "").strip()
+        self.hermes_platform = _hp or None
+        self.hermes_disabled_toolsets = os.getenv("HERMES_DISABLED_TOOLSETS", "").strip()
+
 
 settings = Settings()

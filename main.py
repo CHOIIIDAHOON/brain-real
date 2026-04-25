@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -6,7 +8,16 @@ from config import settings
 from hermes import hermes_router
 
 
-app = FastAPI(title="Personal Assistant AI API")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    if settings.chat_backend == "hermes":
+        from service import hermes_chat
+
+        hermes_chat.ensure_hermes_import()
+    yield
+
+
+app = FastAPI(title="Personal Assistant AI API", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allow_origins,
@@ -22,7 +33,7 @@ app.include_router(hermes_router)
 
 
 @app.get("/")
-def health() -> dict:
+def health() -> dict:   
     return {"status": "ok", "env": settings.env}
 
 
