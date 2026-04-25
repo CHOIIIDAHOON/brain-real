@@ -276,9 +276,22 @@ def normalize_memory_decision(parsed_data):
     action = str(decision_data.get("action", "skip")).strip().lower()
     if action not in {"add", "skip"}:
         action = "skip"
-    title = to_stored_field(decision_data.get("title", ""), "user_info", 40)
-    content = to_stored_field(decision_data.get("content", ""), "user_profile_update", 120)
-    reason = to_stored_field(decision_data.get("reason", ""), "useful", 40)
+    # add만 저장용 placeholder를 쓴다. skip이면 빈 값은 그대로 두어 로그/의미가 섞이지 않게 한다.
+    title = to_stored_field(
+        decision_data.get("title", ""),
+        "user_info" if action == "add" else "",
+        40,
+    )
+    content = to_stored_field(
+        decision_data.get("content", ""),
+        "user_profile_update" if action == "add" else "",
+        120,
+    )
+    reason = to_stored_field(
+        decision_data.get("reason", ""),
+        "useful" if action == "add" else "",
+        40,
+    )
 
     tags_raw = decision_data.get("tags", [])
     tags = []
@@ -339,11 +352,13 @@ def decide_memory_with_ollama(model, user_message, answer, session_id=None, flow
     decision_prompt = (
         "One line JSON only:\n"
         '{"action":"add|skip","title":"","content":"","tags":[],"reason":""}\n'
-        "Decide if the assistant should remember this user long-term. add=durable personal facts (identity, "
-        "name in any language, job, place, prefs, standing rules). skip=greetings/thanks, one-off tasks, no "
-        "new user fact. Non-English facts ok in title/content; tags: <=5 Latin snake_case (name, work, …). "
-        "Limits: title<=40, content<=120, reason<=40. skip: empty title/content/tags, reason only. "
-        "Valid UTF-8 JSON, no control chars in strings.\n"
+        "add=durable facts about the user or their close circle the assistant should recall later: identity, "
+        "job, place, prefs, rules. Include family/relationship facts (spouse/children/parents: names, jobs, "
+        "roles) whenever the user states them as fact—e.g. Korean: 아내/남편/자녀 + 직업·이름. "
+        "skip only for thanks/greetings, chit-chat with no storable fact, or one-off task detail. "
+        "Non-English in title/content ok; tags: <=5 Latin snake_case. Limits: title<=40, content<=120, "
+        "reason<=40. If skip: \"\" for title, content, tags; reason explains skip (e.g. no_new_fact). "
+        "Valid UTF-8; no control chars in strings.\n"
         f"USER: {trimmed_user_message}\n"
         f"ASSISTANT: {trimmed_answer}\n"
     )
