@@ -337,31 +337,13 @@ def decide_memory_with_ollama(model, user_message, answer, session_id=None, flow
     trimmed_user_message = trim_for_memory_decision(user_message, max_chars)
     trimmed_answer = trim_for_memory_decision(answer, max_chars)
     decision_prompt = (
-        "Return ONLY compact JSON on one line:\n"
+        "One line JSON only:\n"
         '{"action":"add|skip","title":"","content":"","tags":[],"reason":""}\n'
-        "You are deciding what to store so the assistant can remember this user long-term "
-        "(name, preferences, constraints, recurring context). Prefer saving durable personal facts.\n\n"
-        "When to use action=add:\n"
-        "- Identity: name, how they introduce themselves in ANY language (e.g. Korean like "
-        '"나는 …이야/예요", real name, nickname, pronouns, role).\n'
-        "- Profile: job, workplace, skills, city/timezone, languages, family or pets they mention, "
-        "health or diet only if they clearly state it as a fact about themselves.\n"
-        "- Preferences: communication style, tools, goals, standing rules (\"always…\", \"never…\").\n"
-        "- Stable facts they want remembered, not questions the assistant only answered once.\n\n"
-        "When to use action=skip:\n"
-        "- Pure greetings, thanks, or filler with no new fact.\n"
-        "- One-off task details that will not matter in future chats.\n"
-        "- Assistant-only procedural text with nothing new about the user.\n\n"
-        "If the user states facts in Korean (or other non-English), still use action=add; put the fact in "
-        "title/content in the same language as the user when that preserves meaning best (Korean in Korean, etc.). "
-        "Tags stay short Latin snake_case (name, profile, spouse, work, …).\n\n"
-        "Field limits (stay compact but informative):\n"
-        "- title: <= 40 chars, short label (e.g. user_name, work, or Korean label).\n"
-        "- content: <= 120 chars, one clear fact the system can retrieve later.\n"
-        "- tags: <= 5 short snake_case tokens (name, profile, preference, locale, work, etc.).\n"
-        "- reason: <= 40 chars, why add/skip (for add: fact type; for skip: smalltalk/oneoff/etc).\n"
-        "- If skip: empty title, content, tags; reason only.\n\n"
-        "JSON must be valid UTF-8; no control characters in strings.\n\n"
+        "Decide if the assistant should remember this user long-term. add=durable personal facts (identity, "
+        "name in any language, job, place, prefs, standing rules). skip=greetings/thanks, one-off tasks, no "
+        "new user fact. Non-English facts ok in title/content; tags: <=5 Latin snake_case (name, work, …). "
+        "Limits: title<=40, content<=120, reason<=40. skip: empty title/content/tags, reason only. "
+        "Valid UTF-8 JSON, no control chars in strings.\n"
         f"USER: {trimmed_user_message}\n"
         f"ASSISTANT: {trimmed_answer}\n"
     )
