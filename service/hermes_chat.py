@@ -6,9 +6,11 @@ run_agent.AIAgent가 세션/메모리/툴 루프를 담당하므로 별도 Ollam
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from queue import Queue
 from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional
@@ -57,6 +59,74 @@ def hermes_config_snapshot() -> Dict[str, Any]:
         "hermes_disabled_toolsets": _parse_disabled_toolsets(),
         "hermes_trace_log": getattr(settings, "hermes_trace_log", True),
         "hermes_heartbeat_sec": int(getattr(settings, "hermes_heartbeat_interval_seconds", 0) or 0),
+    }
+
+
+def _kst_now_str() -> str:
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).strftime("%Y.%m.%d %H:%M:%S.%f")[:-3]
+
+
+def hermes_heartbeat_payload(
+    *,
+    payload_start: Dict[str, Any],
+    build_ms: int,
+    run_wait_ms: int,
+    heartbeat_n: int,
+    hb_sec: int,
+    turn_start_mono: float,
+    run_start_mono: float,
+    ollama_v1: str,
+    stream_callback: Optional[Callable],
+) -> Dict[str, Any]:
+    total_ms = int((perf_counter() - turn_start_mono) * 1000)
+    pre_run_ms = int((run_start_mono - turn_start_mono) * 1000)
+    ollama_base = str(settings.ollama_base_url).rstrip("/")
+    loopback = "127.0.0.1" in ollama_v1 or "localhost" in ollama_v1.lower()
+    or_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    oa_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    return {
+        **payload_start,
+        "build_ms": build_ms,
+        "pre_run_conversation_ms": pre_run_ms,
+        "wait_ms": run_wait_ms,
+        "run_conversation_wait_ms": run_wait_ms,
+        "since_turn_start_ms": total_ms,
+        "since_turn_start_min": round(total_ms / 60_000, 3),
+        "run_conversation_only_min": round(run_wait_ms / 60_000, 3),
+        "heartbeat_index": heartbeat_n,
+        "heartbeat_interval_sec": hb_sec,
+        "next_heartbeat_in_sec": hb_sec,
+        "wall_clock_kst": _kst_now_str(),
+        "process_id": os.getpid(),
+        "python": sys.version.split()[0] if sys.version else "",
+        "heartbeat_thread": {
+            "name": threading.current_thread().name,
+            "ident": threading.get_ident(),
+        },
+        "active_python_thread_count": len(threading.enumerate()),
+        "ollama": {
+            "v1": ollama_v1,
+            "base_from_settings": ollama_base,
+            "uses_loopback": loopback,
+        },
+        "docker_ollama_hint": (
+            "API가 Docker면 127.0.0.1/localhost:11434 는 컨테이너 내부 — 호스트 Ollama: host.docker.internal:11434 또는 compose 서비스명"
+            if loopback
+            else None
+        ),
+        "app": {
+            "chat_backend": settings.chat_backend,
+            "hermes_heartbeat_sec": hb_sec,
+            "streaming": stream_callback is not None,
+        },
+        "env_keys_relevant": {
+            "openrouter_set": bool(or_key),
+            "openai_key_set": bool(oa_key),
+            "hermes_trace": getattr(settings, "hermes_trace_log", True),
+        },
+        "ollama_reachability_hint": f'curl -sS --connect-timeout 2 --max-time 5 "{ollama_base}/api/tags" | head -c 400',
+        "note": "since_turn_start_ms=에이전트 빌드+run_conversation. wait_ms=run_conversation 진입 이후만. session_id+flow_id로 동일 요청만 필터.",
     }
 
 
@@ -237,25 +307,34 @@ def run_hermes_conversation(
 
         def _heartbeat_thread_fn() -> None:
             n = 0
+            ollama_v1 = ollama_openai_base_url()
             while not stop_heartbeat.wait(float(hb_sec)):
                 n += 1
                 w = int((perf_counter() - t_run0) * 1000)
-                write_chat_log(
-                    "hermes_heartbeat",
-                    {
-                        **payload_start,
-                        "build_ms": build_ms,
-                        "wait_ms": w,
-                        "heartbeat_n": n,
-                        "ollama_v1": ollama_openai_base_url(),
-                        "note": "Ollama/툴 응답 대기( thinking 직후 오래 잠잠 = 첫 API 지연·GPU·툴 중 하나)",
-                    },
+                detail = hermes_heartbeat_payload(
+                    payload_start=payload_start,
+                    build_ms=build_ms,
+                    run_wait_ms=w,
+                    heartbeat_n=n,
+                    hb_sec=hb_sec,
+                    turn_start_mono=started,
+                    run_start_mono=t_run0,
+                    ollama_v1=ollama_v1,
+                    stream_callback=stream_callback,
                 )
+                write_chat_log("hermes_heartbeat", detail)
                 log_chat_flow(
                     session_id,
                     fid,
                     "Hermes 응답 대기(heartbeat)",
-                    {"wait_ms": w, "n": n},
+                    {
+                        "heartbeat_n": n,
+                        "run_conversation_wait_ms": w,
+                        "since_turn_start_ms": detail.get("since_turn_start_ms"),
+                        "run_only_min": detail.get("run_conversation_only_min"),
+                        "wall_kst": detail.get("wall_clock_kst"),
+                        "loopback_ollama": (detail.get("ollama") or {}).get("uses_loopback"),
+                    },
                 )
 
         hb_thread: Optional[threading.Thread] = None
