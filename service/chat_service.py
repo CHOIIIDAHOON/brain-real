@@ -1,7 +1,5 @@
 """
-채팅 처리 핵심 서비스.
-CHAT_BACKEND=ollama(기본): Ollama /api/generate 직접.
-CHAT_BACKEND=hermes(선택): Nous Hermes Agent(AIAgent) — hermes-agent 패키지·Python 3.11+ 필요.
+채팅 처리 핵심 서비스. Ollama /api/generate 직접.
 """
 
 import json
@@ -9,7 +7,6 @@ import os
 import re
 import threading
 import uuid
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from queue import Queue
 from time import perf_counter
@@ -20,12 +17,9 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from config import settings
-from hermes.service import hermes_service
+from service import chat_memory_store
 
 chat_sessions = {}
-# Hermes multi-turn: AIAgent run_conversation이 기대하는 messages 누적
-hermes_session_messages: dict = {}
-hermes_locks: defaultdict = defaultdict(threading.Lock)
 max_session_turns = 20
 stream_headers = {
     "Cache-Control": "no-cache, no-transform",
@@ -233,24 +227,24 @@ def ensure_memory_worker():
         write_chat_log("메모리 워커 기동", {})
 
 
-# Hermes 글로벌 메모리를 조회한다.
-def fetch_hermes_memory(limit, session_id=None, flow_id=None):
+# 인메모리 글로벌 메모리를 조회한다.
+def fetch_stored_memories(limit, session_id=None, flow_id=None):
     write_chat_log(
-        "hermes 조회 요청",
+        "chat_memory 조회 요청",
         {"limit": limit, "session_id": session_id, "flow_id": flow_id},
     )
-    memory_rows = hermes_service.list_memory(limit=limit)
+    memory_rows = chat_memory_store.list_memories(limit=limit)
     write_chat_log(
-        "hermes 조회 응답",
+        "chat_memory 조회 응답",
         {"limit": limit, "count": len(memory_rows), "session_id": session_id, "flow_id": flow_id},
     )
     return memory_rows
 
 
-# Hermes 글로벌 메모리에 새 항목을 저장한다.
-def save_hermes_memory(title, content, tags, source, session_id, user_message, flow_id=None):
+# 인메모리 글로벌 메모리에 항목을 추가한다.
+def save_stored_memory(title, content, tags, source, session_id, user_message, flow_id=None):
     write_chat_log(
-        "hermes 저장 요청",
+        "chat_memory 저장 요청",
         {
             "title": title,
             "content_preview": content[:200],
@@ -260,7 +254,7 @@ def save_hermes_memory(title, content, tags, source, session_id, user_message, f
             "flow_id": flow_id,
         },
     )
-    memory_row = hermes_service.add_memory(
+    memory_row = chat_memory_store.add_memory(
         title=title,
         content=content,
         tags=tags,
@@ -269,7 +263,7 @@ def save_hermes_memory(title, content, tags, source, session_id, user_message, f
         user_message=user_message,
     )
     write_chat_log(
-        "hermes 저장 응답",
+        "chat_memory 저장 응답",
         {
             "memory_id": memory_row.get("memory_id"),
             "title": memory_row.get("title"),
@@ -280,9 +274,9 @@ def save_hermes_memory(title, content, tags, source, session_id, user_message, f
     return memory_row
 
 
-# 프롬프트에 붙일 Hermes 메모리 컨텍스트 문자열을 만든다.
+# 프롬프트에 붙일 저장 메모리 컨텍스트 문자열을 만든다.
 def build_memory_context(session_id=None, flow_id=None):
-    memory_rows = fetch_hermes_memory(
+    memory_rows = fetch_stored_memories(
         limit=settings.chat_first_scan_results,
         session_id=session_id,
         flow_id=flow_id,
@@ -294,7 +288,7 @@ def build_memory_context(session_id=None, flow_id=None):
         )
         return ""
 
-    context_lines = ["[HERMES_GLOBAL_MEMORY_CONTEXT]"]
+    context_lines = ["[CHAT_GLOBAL_MEMORY_CONTEXT]"]
     for row_index, memory_row in enumerate(memory_rows, start=1):
         title = memory_row.get("title", "").strip()
         content = memory_row.get("content", "").strip()
@@ -310,7 +304,7 @@ def build_memory_context(session_id=None, flow_id=None):
         )
         return ""
 
-    context_lines.append("[END_HERMES_GLOBAL_MEMORY_CONTEXT]")
+    context_lines.append("[END_CHAT_GLOBAL_MEMORY_CONTEXT]")
     write_chat_log(
         "프롬프트 메모리 문맥",
         {"session_id": session_id, "flow_id": flow_id, "applied": True, "count": max(len(context_lines) - 2, 0)},
@@ -411,7 +405,7 @@ def is_duplicate_memory(text, session_id=None, flow_id=None):
     normalized_text = text.strip().lower()
     if not normalized_text:
         return True
-    existing_rows = fetch_hermes_memory(limit=100, session_id=session_id, flow_id=flow_id)
+    existing_rows = fetch_stored_memories(limit=100, session_id=session_id, flow_id=flow_id)
     for existing_row in existing_rows:
         existing_content = str(existing_row.get("content", "")).strip().lower()
         if existing_content and (existing_content in normalized_text or normalized_text in existing_content):
@@ -608,7 +602,7 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
 
     title = decision["title"] or user_message.strip().replace("\n", " ")[:50] or "chat_memory"
     log_chat_flow(session_id, flow_id or "n/a", "메모리 저장 시작", {"title": title})
-    memory_row = save_hermes_memory(
+    memory_row = save_stored_memory(
         title=title,
         content=content,
         tags=decision["tags"],
@@ -637,8 +631,6 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
 
 # 메모리 저장 작업을 큐에 안전하게 등록한다.
 def schedule_memory_store(session_id, user_message, answer, model, flow_id=None):
-    if settings.chat_backend == "hermes":
-        return
     ensure_memory_worker()
     cooldown_seconds = settings.chat_memory_session_cooldown_seconds
     now = perf_counter()
@@ -978,153 +970,6 @@ def save_chat_turn(session_id, user_message, answer, model_name, flow_id):
     )
 
 
-# CHAT_BACKEND=hermes: AIAgent + Ollama(OpenAI /v1) — 스텁 hermes_service 메모리 주입/직접 Ollama와 병행하지 않는다.
-def _process_hermes_chat_request(chat_request, request_info, session_id, flow_id):
-    from service import hermes_chat
-
-    try:
-        hermes_chat.ensure_hermes_import()
-    except Exception as exc:
-        write_chat_log("hermes_import_failed", {"error": str(exc), "flow_id": flow_id, "session_id": session_id})
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Hermes Agent(run_agent)를 불러올 수 없습니다. "
-                "requirements의 hermes-agent 설치를 확인하세요. "
-                f"({exc})"
-            ),
-        ) from exc
-
-    write_chat_log(
-        "hermes_http_request",
-        {
-            "session_id": session_id,
-            "flow_id": flow_id,
-            "new_chat": chat_request.new_chat,
-            "stream": chat_request.stream,
-            **hermes_chat.hermes_config_snapshot(),
-        },
-    )
-    log_chat_flow(
-        session_id,
-        flow_id,
-        "요청 수신(hermes)",
-        {"new_chat": chat_request.new_chat, "stream": chat_request.stream, "path": "hermes_agent"},
-    )
-    with hermes_locks[session_id]:
-        conversation_history = hermes_session_messages.get(session_id)
-        if conversation_history is not None:
-            conversation_history = list(conversation_history)
-    log_chat_flow(
-        session_id,
-        flow_id,
-        "세션(hermes) 로드",
-        {
-            "path": "hermes_agent",
-            "message_count": len(conversation_history or []),
-        },
-    )
-    raw_system = chat_request.system_prompt or settings.default_system_prompt or ""
-    system_message = raw_system.strip() or None
-    model_name = str(chat_request.model or settings.ollama_model)
-    user_message = chat_request.message
-    client = client_meta(request_info)
-
-    def persist_hermes_turn(_final: str, result: dict) -> None:
-        with hermes_locks[session_id]:
-            hermes_session_messages[session_id] = list(result.get("messages") or [])
-
-    if chat_request.stream:
-
-        def on_complete(final_text, result):
-            persist_hermes_turn(final_text, result)
-            log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "ok", "path": "hermes_agent", "stream": True})
-
-        # StreamingResponse: 클라이언트가 SSE body를 읽기 시작한 뒤에만 제너레이터가 돌고 hermes_turn_start가 찍힌다.
-        log_chat_flow(
-            session_id,
-            flow_id,
-            "Hermes 스트리밍 응답 반환(이후 클라이언트 수신 시 턴·툴 로딩이 시작됨)",
-            {
-                "stream": True,
-                "path": "hermes_agent",
-                "client_build": client.get("build", ""),
-            },
-        )
-        return StreamingResponse(
-            hermes_chat.hermes_stream_generator(
-                user_message=user_message,
-                system_message=system_message,
-                conversation_history=conversation_history,
-                model=model_name,
-                session_id=session_id,
-                on_complete=on_complete,
-                log_context={
-                    "session_id": session_id,
-                    "model": model_name,
-                    "flow_id": flow_id,
-                    **hermes_chat.hermes_config_snapshot(),
-                },
-            ),
-            media_type="text/event-stream; charset=utf-8",
-            headers={
-                **stream_headers,
-                "X-DABO-Client": client["client"],
-                "X-DABO-Build": client["build"],
-                "X-API-Version": client["api_version"],
-                "X-Session-Id": session_id,
-                "X-Chat-Backend": "hermes",
-            },
-        )
-
-    try:
-        log_chat_flow(session_id, flow_id, "Hermes LLM 호출 시작", {"stream": False, "path": "hermes_agent"})
-        result = hermes_chat.run_hermes_conversation(
-            user_message=user_message,
-            system_message=system_message,
-            conversation_history=conversation_history,
-            model=model_name,
-            session_id=session_id,
-            flow_id=flow_id,
-        )
-        answer = normalize_answer_text(result.get("final_response", ""))
-        write_chat_log(
-            "hermes_http_response",
-            {
-                "session_id": session_id,
-                "flow_id": flow_id,
-                "model": model_name,
-                "stream": False,
-                "answer_preview": hermes_chat.hermes_answer_preview(answer, 500),
-                "result_messages_persisted": len(result.get("messages") or []),
-            },
-        )
-        persist_hermes_turn(answer, result)
-        log_chat_flow(session_id, flow_id, "LLM 응답 완료", {"stream": False, "path": "hermes_agent"})
-        log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "ok", "path": "hermes_agent"})
-        return {
-            "answer": answer,
-            "model": model_name,
-            "client": client,
-            "session_id": session_id,
-        }
-    except Exception as exc:
-        import traceback
-
-        write_chat_log(
-            "hermes_conversation_error",
-            {
-                "session_id": session_id,
-                "flow_id": flow_id,
-                "error": repr(exc),
-                "traceback": traceback.format_exc(),
-                **hermes_chat.hermes_config_snapshot(),
-            },
-        )
-        log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "error", "path": "hermes_agent", "error": str(exc)})
-        raise HTTPException(status_code=500, detail=f"Hermes conversation error: {exc}") from exc
-
-
 # 채팅 요청 1건을 처리하고 일반/스트리밍 응답을 반환한다.
 def process_chat_request(chat_request, request_info):
     session_id = chat_request.session_id or str(uuid.uuid4())
@@ -1137,10 +982,6 @@ def process_chat_request(chat_request, request_info):
     )
     if chat_request.new_chat:
         chat_sessions.pop(session_id, None)
-        hermes_session_messages.pop(session_id, None)
-
-    if settings.chat_backend == "hermes":
-        return _process_hermes_chat_request(chat_request, request_info, session_id, flow_id)
 
     history = chat_sessions.get(session_id, [])
     log_chat_flow(
@@ -1151,7 +992,7 @@ def process_chat_request(chat_request, request_info):
     )
     prompt = build_session_prompt(history, chat_request.message)
 
-    log_chat_flow(session_id, flow_id, "Hermes 메모리 조회 시작")
+    log_chat_flow(session_id, flow_id, "저장 메모리 조회 시작")
     use_memory_context = True
     if settings.chat_memory_context_first_turn_only and len(history) > 0:
         use_memory_context = False
@@ -1161,7 +1002,7 @@ def process_chat_request(chat_request, request_info):
     log_chat_flow(
         session_id,
         flow_id,
-        "Hermes 메모리 조회 끝",
+        "저장 메모리 조회 끝",
         {
             "memory_context_applied": bool(memory_context),
             "memory_context_first_turn_only": settings.chat_memory_context_first_turn_only,

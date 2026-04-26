@@ -77,43 +77,5 @@ class Settings:
         }
         self.chat_log_path = os.getenv("CHAT_LOG_PATH", "./logs/chat_events.jsonl")
 
-        # ollama = 직접 Ollama /api/generate(기본). hermes = Nous Hermes Agent(별도 hermes-agent 패키지·3.11+)
-        _chat_backend_env = os.getenv("CHAT_BACKEND", "").strip().lower()
-        if _chat_backend_env:
-            self.chat_backend = _chat_backend_env
-        else:
-            self.chat_backend = "ollama"
-        # OpenAI 클라이언트에 넘기는 키. 로컬 Ollama는 임의 비공백 값이면 된다( run_agent: api_key and base_url ).
-        self.hermes_ollama_api_key = (os.getenv("HERMES_OLLAMA_API_KEY", "not-needed") or "not-needed").strip()
-        self.hermes_max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "30"))
-        self.hermes_skip_context_files = os.getenv("HERMES_SKIP_CONTEXT_FILES", "true").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        self.hermes_skip_memory = os.getenv("HERMES_SKIP_MEMORY", "false").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        _hp = os.getenv("HERMES_PLATFORM", "").strip()
-        self.hermes_platform = _hp or None
-        self.hermes_disabled_toolsets = os.getenv("HERMES_DISABLED_TOOLSETS", "").strip()
-        # 쉼표. 비어 있으면 툴 전부(필터는 disabled와 조합). 지정 시 초기화·툴 수 감소로 첫 응답이 빨라질 수 있음(예: reasoning, web)
-        self.hermes_enabled_toolsets = os.getenv("HERMES_ENABLED_TOOLSETS", "").strip()
-        # Hermes 콜백(툴/상태 등) — False면 hermes_cb_* / log_chat_flow 상세 끔
-        self.hermes_trace_log = os.getenv("HERMES_TRACE_LOG", "true").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        # SSE 첫 토큰 지연이 이 값(ms) 초과일 때 hermes_ttfb_warn 이벤트. 0이면 끔.
-        self.hermes_ttfb_warn_ms = int(os.getenv("HERMES_TTFB_WARN_MS", "120000"))
-        # run_conversation가 오래 잡혀 있을 때 N초마다 hermes_heartbeat. 0이면 끔.
-        self.hermes_heartbeat_interval_seconds = int(os.getenv("HERMES_HEARTBEAT_SEC", "30"))
-
 
 settings = Settings()

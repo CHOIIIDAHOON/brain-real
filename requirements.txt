@@ -2,4 +2,3 @@ fastapi
 uvicorn
 chromadb
 python-dotenv
-# CHAT_BACKEND=hermes 쓰려면(선택): pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git"
