@@ -87,6 +87,7 @@ def hermes_heartbeat_payload(
     oa_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     return {
         **payload_start,
+        "schema": "v2",
         "build_ms": build_ms,
         "pre_run_conversation_ms": pre_run_ms,
         "wait_ms": run_wait_ms,
@@ -95,6 +96,7 @@ def hermes_heartbeat_payload(
         "since_turn_start_min": round(total_ms / 60_000, 3),
         "run_conversation_only_min": round(run_wait_ms / 60_000, 3),
         "heartbeat_index": heartbeat_n,
+        "n": heartbeat_n,
         "heartbeat_interval_sec": hb_sec,
         "next_heartbeat_in_sec": hb_sec,
         "wall_clock_kst": _kst_now_str(),
@@ -328,12 +330,18 @@ def run_hermes_conversation(
                     fid,
                     "Hermes 응답 대기(heartbeat)",
                     {
-                        "heartbeat_n": n,
+                        "n": n,
+                        "schema": "v2",
                         "run_conversation_wait_ms": w,
+                        "run_conversation_wait_min": round(w / 60_000, 2),
                         "since_turn_start_ms": detail.get("since_turn_start_ms"),
-                        "run_only_min": detail.get("run_conversation_only_min"),
+                        "since_turn_start_min": detail.get("since_turn_start_min"),
+                        "pre_run_conversation_ms": detail.get("pre_run_conversation_ms"),
+                        "build_ms": build_ms,
                         "wall_kst": detail.get("wall_clock_kst"),
+                        "process_id": detail.get("process_id"),
                         "loopback_ollama": (detail.get("ollama") or {}).get("uses_loopback"),
+                        "ollama_v1": (detail.get("ollama") or {}).get("v1"),
                     },
                 )
 
