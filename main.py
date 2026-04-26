@@ -23,7 +23,12 @@ async def _lifespan(_app: FastAPI):
         hermes_chat.ensure_hermes_import()
         write_chat_log(
             "hermes_app_startup_ok",
-            {"python": sys.version, "ollama_model": settings.ollama_model, **hermes_chat.hermes_config_snapshot()},
+            {
+                "python": sys.version,
+                "ollama_model": settings.ollama_model,
+                "hermes_trace_log": settings.hermes_trace_log,
+                **hermes_chat.hermes_config_snapshot(),
+            },
         )
     yield
 

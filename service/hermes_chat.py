@@ -55,6 +55,7 @@ def hermes_config_snapshot() -> Dict[str, Any]:
         "hermes_platform": settings.hermes_platform,
         "hermes_enabled_toolsets": _parse_enabled_toolsets(),
         "hermes_disabled_toolsets": _parse_disabled_toolsets(),
+        "hermes_trace_log": getattr(settings, "hermes_trace_log", True),
     }
 
 
@@ -63,28 +64,104 @@ def ensure_hermes_import() -> None:
     from run_agent import AIAgent  # noqa: F401
 
 
+def _clip_repr(value: Any, max_len: int = 900) -> str:
+    try:
+        text = repr(value)
+    except Exception:
+        text = f"<{type(value).__name__}>"
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _hermes_trace_callback_kwargs(
+    session_id: str, flow_id: Optional[str]
+) -> Dict[str, Any]:
+    """HERMES_TRACE_LOG=1 일 때 AIAgent 툴/상태/스텝 콜백 — 어디서 오래 걸리는지 추적용."""
+    if not getattr(settings, "hermes_trace_log", True):
+        return {}
+    from service.chat_service import log_chat_flow, write_chat_log
+
+    b = {"session_id": session_id, "flow_id": flow_id or "n/a"}
+
+    def on_tool_progress(*args: Any, **kwargs: Any) -> None:
+        write_chat_log("hermes_cb_tool_progress", {**b, "args": _clip_repr(args), "kwargs": _clip_repr(kwargs) if kwargs else {}})
+
+    def on_tool_start(*args: Any, **kwargs: Any) -> None:
+        try:
+            name = str(args[0]) if args else ""
+        except Exception:
+            name = "?"
+        write_chat_log("hermes_cb_tool_start", {**b, "args": _clip_repr(args, 1200)})
+        log_chat_flow(
+            session_id,
+            b["flow_id"],
+            "Hermes 툴 시작",
+            {
+                "tool": name[:120] if name else "?",
+                "arg_preview": _clip_repr(args[1:3] if len(args) > 1 else args, 400),
+            },
+        )
+
+    def on_tool_complete(*args: Any, **kwargs: Any) -> None:
+        write_chat_log("hermes_cb_tool_complete", {**b, "args": _clip_repr(args, 1200)})
+
+    def on_status(*args: Any, **kwargs: Any) -> None:
+        write_chat_log("hermes_cb_status", {**b, "payload": _clip_repr(args, 1500)})
+
+    def on_step(*args: Any, **kwargs: Any) -> None:
+        write_chat_log("hermes_cb_step", {**b, "payload": _clip_repr(args, 1500)})
+
+    def on_thinking(*args: Any, **kwargs: Any) -> None:
+        write_chat_log("hermes_cb_thinking", {**b, "payload": _clip_repr(args, 800)})
+
+    def on_reasoning(*args: Any, **kwargs: Any) -> None:
+        write_chat_log("hermes_cb_reasoning", {**b, "payload": _clip_repr(args, 800)})
+
+    def on_interim_assistant(*args: Any, **kwargs: Any) -> None:
+        write_chat_log("hermes_cb_interim_assistant", {**b, "payload": _clip_repr(args, 600)})
+
+    def on_tool_gen(*args: Any, **kwargs: Any) -> None:
+        write_chat_log("hermes_cb_tool_gen", {**b, "args": _clip_repr(args, 600)})
+
+    return {
+        "tool_progress_callback": on_tool_progress,
+        "tool_start_callback": on_tool_start,
+        "tool_complete_callback": on_tool_complete,
+        "status_callback": on_status,
+        "step_callback": on_step,
+        "thinking_callback": on_thinking,
+        "reasoning_callback": on_reasoning,
+        "interim_assistant_callback": on_interim_assistant,
+        "tool_gen_callback": on_tool_gen,
+    }
+
+
 def _build_agent(
     *,
     model: str,
     session_id: str,
     ephemeral_system_prompt: Optional[str],
+    flow_id: Optional[str] = None,
 ) -> Any:
     from run_agent import AIAgent
 
-    return AIAgent(
-        model=model,
-        base_url=ollama_openai_base_url(),
-        api_key=settings.hermes_ollama_api_key,
-        quiet_mode=True,
-        max_iterations=settings.hermes_max_iterations,
-        session_id=session_id,
-        skip_context_files=settings.hermes_skip_context_files,
-        skip_memory=settings.hermes_skip_memory,
-        ephemeral_system_prompt=ephemeral_system_prompt,
-        platform=settings.hermes_platform,
-        enabled_toolsets=_parse_enabled_toolsets(),
-        disabled_toolsets=_parse_disabled_toolsets(),
-    )
+    params: Dict[str, Any] = {
+        "model": model,
+        "base_url": ollama_openai_base_url(),
+        "api_key": settings.hermes_ollama_api_key,
+        "quiet_mode": True,
+        "max_iterations": settings.hermes_max_iterations,
+        "session_id": session_id,
+        "skip_context_files": settings.hermes_skip_context_files,
+        "skip_memory": settings.hermes_skip_memory,
+        "ephemeral_system_prompt": ephemeral_system_prompt,
+        "platform": settings.hermes_platform,
+        "enabled_toolsets": _parse_enabled_toolsets(),
+        "disabled_toolsets": _parse_disabled_toolsets(),
+    }
+    params.update(_hermes_trace_callback_kwargs(session_id, flow_id))
+    return AIAgent(**params)
 
 
 def run_hermes_conversation(
@@ -125,6 +202,7 @@ def run_hermes_conversation(
             model=model,
             session_id=session_id,
             ephemeral_system_prompt=None,
+            flow_id=fid,
         )
         build_ms = int((perf_counter() - t_build0) * 1000)
         write_chat_log("hermes_agent_built", {**payload_start, "build_ms": build_ms})
@@ -135,6 +213,24 @@ def run_hermes_conversation(
             {"build_ms": build_ms, "hint": "툴/클라이언트 로딩. 오래 걸리면 HERMES_ENABLED_TOOLSETS로 툴을 줄이세요."},
         )
         t_run0 = perf_counter()
+        write_chat_log(
+            "hermes_invoking_run_conversation",
+            {
+                **payload_start,
+                "build_ms": build_ms,
+                "note": "이후 Ollama/툴 콜백: hermes_cb_*",
+            },
+        )
+        log_chat_flow(
+            session_id,
+            fid,
+            "Hermes run_conversation 호출(모델·툴 루프)",
+            {
+                "model": model,
+                "ollama_v1": ollama_openai_base_url(),
+                "streaming": stream_callback is not None,
+            },
+        )
         result = agent.run_conversation(
             user_message,
             system_message=system_message,
@@ -216,6 +312,16 @@ def hermes_stream_generator(
     base_ctx = {**(log_context or {}), **hermes_config_snapshot()}
 
     def work():
+        write_chat_log(
+            "hermes_stream_worker_begin",
+            {
+                **base_ctx,
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "thread": threading.current_thread().name,
+                "thread_id": threading.get_ident(),
+            },
+        )
         try:
             result = run_hermes_conversation(
                 user_message=user_message,
@@ -252,8 +358,17 @@ def hermes_stream_generator(
         },
     )
 
-    thread = threading.Thread(target=work, daemon=True)
+    thread = threading.Thread(target=work, name=f"hermes-sse-{flow_id[:8]}", daemon=True)
     thread.start()
+    write_chat_log(
+        "hermes_stream_thread_started",
+        {
+            **base_ctx,
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "thread_name": thread.name,
+        },
+    )
 
     first_token_latency_ms = None
     answer_parts: List[str] = []

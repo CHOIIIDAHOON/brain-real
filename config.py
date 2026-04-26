@@ -104,6 +104,13 @@ class Settings:
         self.hermes_disabled_toolsets = os.getenv("HERMES_DISABLED_TOOLSETS", "").strip()
         # 쉼표. 비어 있으면 툴 전부(필터는 disabled와 조합). 지정 시 초기화·툴 수 감소로 첫 응답이 빨라질 수 있음(예: reasoning, web)
         self.hermes_enabled_toolsets = os.getenv("HERMES_ENABLED_TOOLSETS", "").strip()
+        # Hermes 콜백(툴/상태 등) — False면 hermes_cb_* / log_chat_flow 상세 끔
+        self.hermes_trace_log = os.getenv("HERMES_TRACE_LOG", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
 
 settings = Settings()
