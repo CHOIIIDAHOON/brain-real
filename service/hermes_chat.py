@@ -222,6 +222,9 @@ def _build_agent(
     params: Dict[str, Any] = {
         "model": model,
         "base_url": ollama_openai_base_url(),
+        # provider 비어 있으면 Hermes 보조(맥락 압축 등)가 main Ollama를 못 잡고 OPENROUTER만 권고한다.
+        # "custom" + base_url이면 run_agent가 동일 OpenAI 호환 엔드포인트로 보조 클라이언트를 연다.
+        "provider": "custom",
         "api_key": settings.hermes_ollama_api_key,
         "quiet_mode": True,
         "max_iterations": settings.hermes_max_iterations,
