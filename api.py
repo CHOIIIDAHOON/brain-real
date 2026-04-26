@@ -3,6 +3,8 @@ API 라우터 전용 파일.
 엔드포인트 정의만 두고 상세 로직은 service 폴더로 분리한다.
 """
 
+import os
+
 from fastapi import APIRouter, Request
 
 from config import settings
@@ -28,8 +30,11 @@ def hermes_in_flight() -> dict:
     return {
         "ok": True,
         "chat_backend": settings.chat_backend,
+        "pid": os.getpid(),
         "count": len(items),
         "items": items,
+        "note": "pid는 이 JSON을 만든 워커(프로세스)만. gunicorn/uvicorn workers>1·리로더면 워커마다 in-flight가 달라서 "
+        "count=0인 워커에 맞다고 생각해도, 다른 worker가 hermes_heartbeat를 찍는 일이 생긴다. 로그 process_id와 비교하세요.",
     }
 
 

@@ -332,6 +332,7 @@ def run_hermes_conversation(
             "turn_start_mono": started,
             "ollama_v1": ollama_openai_base_url(),
             "phase": "building",
+            "worker_pid": os.getpid(),
         },
     ):
         try:
