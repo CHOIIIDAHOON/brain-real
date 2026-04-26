@@ -69,6 +69,14 @@ class Settings:
         self.chat_memory_decision_num_predict = int(decision_num_predict)
         self.chat_memory_skip_short_question_len = int(os.getenv("CHAT_MEMORY_SKIP_SHORT_QUESTION_LEN", "18"))
         self.chat_memory_session_cooldown_seconds = int(os.getenv("CHAT_MEMORY_SESSION_COOLDOWN_SECONDS", "10"))
+        # false: Ollama 저장 판단·인메모리 큐·프롬프트에 저장 메모리 붙이기 모두 생략(Chroma 이전).
+        # true: decide_memory / schedule_memory / build_memory_context(주입) 동작(추가 예정: Chroma 저장으로 확장).
+        self.chat_memory_store_enabled = os.getenv("CHAT_MEMORY_STORE_ENABLED", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.chat_log_enabled = os.getenv("CHAT_LOG_ENABLED", "true").lower() in {
             "1",
             "true",

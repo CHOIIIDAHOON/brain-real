@@ -276,6 +276,8 @@ def save_stored_memory(title, content, tags, source, session_id, user_message, f
 
 # 프롬프트에 붙일 저장 메모리 컨텍스트 문자열을 만든다.
 def build_memory_context(session_id=None, flow_id=None):
+    if not settings.chat_memory_store_enabled:
+        return ""
     memory_rows = fetch_stored_memories(
         limit=settings.chat_first_scan_results,
         session_id=session_id,
@@ -514,6 +516,8 @@ def decide_memory_with_ollama(model, user_message, answer, session_id=None, flow
 
 # 응답 완료 후 메모리 저장 파이프라인을 실행한다.
 def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=None):
+    if not settings.chat_memory_store_enabled:
+        return
     if settings.chat_memory_decision_mode.lower() != "ollama":
         write_chat_log(
             "메모리 저장 생략",
@@ -631,6 +635,8 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
 
 # 메모리 저장 작업을 큐에 안전하게 등록한다.
 def schedule_memory_store(session_id, user_message, answer, model, flow_id=None):
+    if not settings.chat_memory_store_enabled:
+        return
     ensure_memory_worker()
     cooldown_seconds = settings.chat_memory_session_cooldown_seconds
     now = perf_counter()
