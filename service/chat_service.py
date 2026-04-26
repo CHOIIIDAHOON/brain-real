@@ -1,7 +1,7 @@
 """
 채팅 처리 핵심 서비스.
-CHAT_BACKEND=hermes 이면 Nous Hermes Agent(AIAgent)가 Ollama(OpenAI 호환)을 사용해 응답한다.
-CHAT_BACKEND=ollama 이면 기존 직접 /api.generate 경로다.
+CHAT_BACKEND=ollama(기본): Ollama /api/generate 직접.
+CHAT_BACKEND=hermes(선택): Nous Hermes Agent(AIAgent) — hermes-agent 패키지·Python 3.11+ 필요.
 """
 
 import json

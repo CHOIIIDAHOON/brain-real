@@ -26,15 +26,18 @@ def chat(chat_request: ChatRequest, request_info: Request):
 # Hermes run_conversation()이 아직 끝나지 않은 요청(동일 API 프로세스). stuck 디버깅용.
 @chat_router.get("/hermes-in-flight")
 def hermes_in_flight() -> dict:
-    items = hermes_chat.get_hermes_in_flight_items()
+    items = hermes_chat.get_hermes_in_flight_items() if settings.chat_backend == "hermes" else []
+    note = (
+        "CHAT_BACKEND=ollama: Hermes in-flight는 사용하지 않으므로 항상 비어 있음. "
+        "CHAT_BACKEND=hermes: pid=이 워커. workers>1이면 worker마다 in-flight가 다름(로그 process_id 대조)."
+    )
     return {
         "ok": True,
         "chat_backend": settings.chat_backend,
         "pid": os.getpid(),
         "count": len(items),
         "items": items,
-        "note": "pid는 이 JSON을 만든 워커(프로세스)만. gunicorn/uvicorn workers>1·리로더면 워커마다 in-flight가 달라서 "
-        "count=0인 워커에 맞다고 생각해도, 다른 worker가 hermes_heartbeat를 찍는 일이 생긴다. 로그 process_id와 비교하세요.",
+        "note": note,
     }
 
 

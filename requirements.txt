@@ -2,5 +2,4 @@ fastapi
 uvicorn
 chromadb
 python-dotenv
-# hermes-agent는 Python >=3.11 전용( pyproject: requires-python >=3.11 ). 3.10에서는 이 줄이 무시된다.
-hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git ; python_version >= "3.11"
+# CHAT_BACKEND=hermes 쓰려면(선택): pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git"

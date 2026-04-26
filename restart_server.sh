@@ -23,9 +23,38 @@ LOG_FILE="${LOG_FILE:-app.log}"
 
 DECISION_MODEL_MSG="${CHAT_MEMORY_DECISION_MODEL:-chat model fallback}"
 
-echo "[restart] stopping old uvicorn..."
-pkill -f "uvicorn main:app" || true
+# --- 기존 uvicorn 종료 (TERM → 남으면 -9) ------------------------------------
+echo "[restart] stopping old uvicorn (main:app)…"
+pkill -f "uvicorn main:app" 2>/dev/null || true
+pkill -f "uvicorn.*main:app" 2>/dev/null || true
+sleep 2
+# 늦게 죽는·좀비에 가까운 잔류: SIGKILL
+pkill -9 -f "uvicorn main:app" 2>/dev/null || true
+pkill -9 -f "uvicorn.*main:app" 2>/dev/null || true
 sleep 1
+# 이 포트에 LISTEN 중인 프로세스(패턴이 달라도) 마무리
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k "${APP_PORT}/tcp" 2>/dev/null || true
+  fuser -k -9 "${APP_PORT}/tcp" 2>/dev/null || true
+fi
+if command -v lsof >/dev/null 2>&1; then
+  pids_lsof=$(lsof -t -iTCP:"${APP_PORT}" -sTCP:LISTEN 2>/dev/null || true)
+  for p in ${pids_lsof}; do
+    if [ -n "${p}" ]; then
+      kill "${p}" 2>/dev/null || true
+      sleep 1
+      kill -9 "${p}" 2>/dev/null || true
+    fi
+  done
+fi
+sleep 1
+# 여전히 포트가 쓰이면: systemd/다른 유저/수동 nohup 등 — 로그로 보이게만 함
+if command -v ss >/dev/null 2>&1; then
+  if ss -tlnp 2>/dev/null | grep -qE ":${APP_PORT}\s"; then
+    echo "[restart] warn: :${APP_PORT} 아직 점유 중. 아래에 LISTEN이 보이면 PID를 수동 kill 하거나( kill -9 PID ) 같은 포트 쓰는 서비스를 끄세요."
+    ss -tlnp 2>/dev/null | grep -E ":${APP_PORT}\s" || true
+  fi
+fi
 
 echo "[restart] starting uvicorn on ${APP_HOST}:${APP_PORT}..."
 echo "[restart] memory decision model=${DECISION_MODEL_MSG}"
