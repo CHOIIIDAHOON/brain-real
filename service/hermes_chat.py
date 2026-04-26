@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from contextlib import contextmanager
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -56,6 +57,15 @@ def get_hermes_in_flight_items() -> List[Dict[str, Any]]:
                 r["run_conversation_wait_ms"] = None
             items.append(r)
         return items
+
+
+@contextmanager
+def _hermes_turn_in_flight(fid: str, row: Dict[str, Any]):
+    _hermes_in_flight_register(fid, row)
+    try:
+        yield
+    finally:
+        _hermes_in_flight_unregister(fid)
 
 
 def ollama_openai_base_url() -> str:
@@ -312,146 +322,173 @@ def run_hermes_conversation(
         {"model": model, "streaming": stream_callback is not None, "history_messages": len(conversation_history or [])},
     )
     started = perf_counter()
-    try:
-        t_build0 = perf_counter()
-        agent = _build_agent(
-            model=model,
-            session_id=session_id,
-            ephemeral_system_prompt=None,
-            flow_id=fid,
-        )
-        build_ms = int((perf_counter() - t_build0) * 1000)
-        write_chat_log("hermes_agent_built", {**payload_start, "build_ms": build_ms})
-        log_chat_flow(
-            session_id,
-            fid,
-            "Hermes AIAgent 초기화 끝",
-            {"build_ms": build_ms, "hint": "툴/클라이언트 로딩. 오래 걸리면 HERMES_ENABLED_TOOLSETS로 툴을 줄이세요."},
-        )
-        t_run0 = perf_counter()
-        write_chat_log(
-            "hermes_invoking_run_conversation",
-            {
-                **payload_start,
-                "build_ms": build_ms,
-                "note": "이후 Ollama/툴 콜백: hermes_cb_*",
-            },
-        )
-        log_chat_flow(
-            session_id,
-            fid,
-            "Hermes run_conversation 호출(모델·툴 루프)",
-            {
-                "model": model,
-                "ollama_v1": ollama_openai_base_url(),
-                "streaming": stream_callback is not None,
-            },
-        )
-        hb_sec = int(getattr(settings, "hermes_heartbeat_interval_seconds", 30) or 0)
-        stop_heartbeat = threading.Event()
+    with _hermes_turn_in_flight(
+        fid,
+        {
+            "session_id": session_id,
+            "model": model,
+            "streaming": stream_callback is not None,
+            "user_message_preview": _user_text_preview(user_message),
+            "turn_start_mono": started,
+            "ollama_v1": ollama_openai_base_url(),
+            "phase": "building",
+        },
+    ):
+        try:
+            t_build0 = perf_counter()
+            agent = _build_agent(
+                model=model,
+                session_id=session_id,
+                ephemeral_system_prompt=None,
+                flow_id=fid,
+            )
+            build_ms = int((perf_counter() - t_build0) * 1000)
+            write_chat_log("hermes_agent_built", {**payload_start, "build_ms": build_ms})
+            log_chat_flow(
+                session_id,
+                fid,
+                "Hermes AIAgent 초기화 끝",
+                {"build_ms": build_ms, "hint": "툴/클라이언트 로딩. 오래 걸리면 HERMES_ENABLED_TOOLSETS로 툴을 줄이세요."},
+            )
+            t_run0 = perf_counter()
+            _hermes_in_flight_update(
+                fid,
+                {
+                    "run_start_mono": t_run0,
+                    "build_ms": build_ms,
+                    "phase": "run_conversation",
+                },
+            )
+            write_chat_log(
+                "hermes_invoking_run_conversation",
+                {
+                    **payload_start,
+                    "build_ms": build_ms,
+                    "note": "이후 Ollama/툴 콜백: hermes_cb_*",
+                },
+            )
+            log_chat_flow(
+                session_id,
+                fid,
+                "Hermes run_conversation 호출(모델·툴 루프)",
+                {
+                    "model": model,
+                    "ollama_v1": ollama_openai_base_url(),
+                    "streaming": stream_callback is not None,
+                },
+            )
+            hb_sec = int(getattr(settings, "hermes_heartbeat_interval_seconds", 30) or 0)
+            stop_heartbeat = threading.Event()
 
-        def _heartbeat_thread_fn() -> None:
-            n = 0
-            ollama_v1 = ollama_openai_base_url()
-            while not stop_heartbeat.wait(float(hb_sec)):
-                n += 1
-                w = int((perf_counter() - t_run0) * 1000)
-                detail = hermes_heartbeat_payload(
-                    payload_start=payload_start,
-                    build_ms=build_ms,
-                    run_wait_ms=w,
-                    heartbeat_n=n,
-                    hb_sec=hb_sec,
-                    turn_start_mono=started,
-                    run_start_mono=t_run0,
-                    ollama_v1=ollama_v1,
+            def _heartbeat_thread_fn() -> None:
+                n = 0
+                ollama_v1 = ollama_openai_base_url()
+                while not stop_heartbeat.wait(float(hb_sec)):
+                    n += 1
+                    w = int((perf_counter() - t_run0) * 1000)
+                    detail = hermes_heartbeat_payload(
+                        payload_start=payload_start,
+                        build_ms=build_ms,
+                        run_wait_ms=w,
+                        heartbeat_n=n,
+                        hb_sec=hb_sec,
+                        turn_start_mono=started,
+                        run_start_mono=t_run0,
+                        ollama_v1=ollama_v1,
+                        stream_callback=stream_callback,
+                    )
+                    write_chat_log("hermes_heartbeat", detail)
+                    log_chat_flow(
+                        session_id,
+                        fid,
+                        "Hermes 응답 대기(heartbeat)",
+                        {
+                            "n": n,
+                            "schema": "v2",
+                            "run_conversation_wait_ms": w,
+                            "run_conversation_wait_min": round(w / 60_000, 2),
+                            "since_turn_start_ms": detail.get("since_turn_start_ms"),
+                            "since_turn_start_min": detail.get("since_turn_start_min"),
+                            "pre_run_conversation_ms": detail.get("pre_run_conversation_ms"),
+                            "build_ms": build_ms,
+                            "wall_kst": detail.get("wall_clock_kst"),
+                            "process_id": detail.get("process_id"),
+                            "loopback_ollama": (detail.get("ollama") or {}).get("uses_loopback"),
+                            "ollama_v1": (detail.get("ollama") or {}).get("v1"),
+                        },
+                    )
+                    _hermes_in_flight_update(
+                        fid,
+                        {
+                            "last_heartbeat_n": n,
+                            "last_run_conversation_wait_ms": w,
+                        },
+                    )
+
+            hb_thread: Optional[threading.Thread] = None
+            if hb_sec > 0:
+                hb_thread = threading.Thread(
+                    target=_heartbeat_thread_fn,
+                    name=f"hermes-hb-{fid[:8]}",
+                    daemon=True,
+                )
+                hb_thread.start()
+            try:
+                result = agent.run_conversation(
+                    user_message,
+                    system_message=system_message,
+                    conversation_history=conversation_history,
                     stream_callback=stream_callback,
                 )
-                write_chat_log("hermes_heartbeat", detail)
-                log_chat_flow(
-                    session_id,
-                    fid,
-                    "Hermes 응답 대기(heartbeat)",
-                    {
-                        "n": n,
-                        "schema": "v2",
-                        "run_conversation_wait_ms": w,
-                        "run_conversation_wait_min": round(w / 60_000, 2),
-                        "since_turn_start_ms": detail.get("since_turn_start_ms"),
-                        "since_turn_start_min": detail.get("since_turn_start_min"),
-                        "pre_run_conversation_ms": detail.get("pre_run_conversation_ms"),
-                        "build_ms": build_ms,
-                        "wall_kst": detail.get("wall_clock_kst"),
-                        "process_id": detail.get("process_id"),
-                        "loopback_ollama": (detail.get("ollama") or {}).get("uses_loopback"),
-                        "ollama_v1": (detail.get("ollama") or {}).get("v1"),
-                    },
-                )
+            finally:
+                stop_heartbeat.set()
+            run_ms = int((perf_counter() - t_run0) * 1000)
+            write_chat_log(
+                "hermes_run_conversation_returned",
+                {**payload_start, "run_conversation_ms": run_ms, "build_ms": build_ms},
+            )
+        except Exception as exc:
+            elapsed_ms = int((perf_counter() - started) * 1000)
+            write_chat_log(
+                "hermes_turn_error",
+                {
+                    **payload_start,
+                    "elapsed_ms": elapsed_ms,
+                    "error": repr(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+            log_chat_flow(
+                session_id,
+                fid,
+                "Hermes turn 실패",
+                {"error": str(exc), "elapsed_ms": elapsed_ms},
+            )
+            raise
 
-        hb_thread: Optional[threading.Thread] = None
-        if hb_sec > 0:
-            hb_thread = threading.Thread(
-                target=_heartbeat_thread_fn,
-                name=f"hermes-hb-{fid[:8]}",
-                daemon=True,
-            )
-            hb_thread.start()
-        try:
-            result = agent.run_conversation(
-                user_message,
-                system_message=system_message,
-                conversation_history=conversation_history,
-                stream_callback=stream_callback,
-            )
-        finally:
-            stop_heartbeat.set()
-        run_ms = int((perf_counter() - t_run0) * 1000)
-        write_chat_log(
-            "hermes_run_conversation_returned",
-            {**payload_start, "run_conversation_ms": run_ms, "build_ms": build_ms},
-        )
-    except Exception as exc:
         elapsed_ms = int((perf_counter() - started) * 1000)
+        messages = result.get("messages") if isinstance(result, dict) else None
+        final_text = (result.get("final_response") or "") if isinstance(result, dict) else ""
         write_chat_log(
-            "hermes_turn_error",
+            "hermes_turn_complete",
             {
                 **payload_start,
                 "elapsed_ms": elapsed_ms,
-                "error": repr(exc),
-                "traceback": traceback.format_exc(),
+                "final_response_chars": len(final_text),
+                "result_messages_count": len(messages) if isinstance(messages, list) else None,
             },
         )
         log_chat_flow(
             session_id,
             fid,
-            "Hermes turn 실패",
-            {"error": str(exc), "elapsed_ms": elapsed_ms},
+            "Hermes turn 완료",
+            {
+                "elapsed_ms": elapsed_ms,
+                "final_response_chars": len(final_text),
+                "result_messages": len(messages) if isinstance(messages, list) else 0,
+            },
         )
-        raise
-
-    elapsed_ms = int((perf_counter() - started) * 1000)
-    messages = result.get("messages") if isinstance(result, dict) else None
-    final_text = (result.get("final_response") or "") if isinstance(result, dict) else ""
-    write_chat_log(
-        "hermes_turn_complete",
-        {
-            **payload_start,
-            "elapsed_ms": elapsed_ms,
-            "final_response_chars": len(final_text),
-            "result_messages_count": len(messages) if isinstance(messages, list) else None,
-        },
-    )
-    log_chat_flow(
-        session_id,
-        fid,
-        "Hermes turn 완료",
-        {
-            "elapsed_ms": elapsed_ms,
-            "final_response_chars": len(final_text),
-            "result_messages": len(messages) if isinstance(messages, list) else 0,
-        },
-    )
-    return result
+        return result
 
 
 def hermes_stream_generator(

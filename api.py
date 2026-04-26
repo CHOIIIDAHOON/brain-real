@@ -5,7 +5,9 @@ API 라우터 전용 파일.
 
 from fastapi import APIRouter, Request
 
+from config import settings
 from service import chat_service, chroma_service, mcp_service
+from service import hermes_chat
 from service.schemas import ChatRequest, ChromaAddRequest, ChromaSearchRequest
 
 chat_router = APIRouter(tags=["chat"])
@@ -17,6 +19,18 @@ mcp_router = APIRouter(prefix="/mcp", tags=["mcp"])
 @chat_router.post("/chat")
 def chat(chat_request: ChatRequest, request_info: Request):
     return chat_service.process_chat_request(chat_request=chat_request, request_info=request_info)
+
+
+# Hermes run_conversation()이 아직 끝나지 않은 요청(동일 API 프로세스). stuck 디버깅용.
+@chat_router.get("/hermes-in-flight")
+def hermes_in_flight() -> dict:
+    items = hermes_chat.get_hermes_in_flight_items()
+    return {
+        "ok": True,
+        "chat_backend": settings.chat_backend,
+        "count": len(items),
+        "items": items,
+    }
 
 
 # Chroma 저장소에 문서를 추가한다.
