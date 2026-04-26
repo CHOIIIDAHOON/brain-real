@@ -17,6 +17,46 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import settings
 
+# Hermes run_conversation()이 끝나기 전까지 id → 메타(조회용). monotonic은 API 응답에서 제외.
+_hermes_in_flight_lock = threading.Lock()
+_hermes_in_flight: Dict[str, Dict[str, Any]] = {}
+
+
+def _hermes_in_flight_register(fid: str, row: Dict[str, Any]) -> None:
+    with _hermes_in_flight_lock:
+        _hermes_in_flight[fid] = row
+
+
+def _hermes_in_flight_update(fid: str, updates: Dict[str, Any]) -> None:
+    with _hermes_in_flight_lock:
+        if fid in _hermes_in_flight:
+            _hermes_in_flight[fid].update(updates)
+
+
+def _hermes_in_flight_unregister(fid: str) -> None:
+    with _hermes_in_flight_lock:
+        _hermes_in_flight.pop(fid, None)
+
+
+def get_hermes_in_flight_items() -> List[Dict[str, Any]]:
+    """GET /chat/hermes-in-flight — 아직 끝나지 않은 Hermes 턴(동일 프로세스)."""
+    now = perf_counter()
+    with _hermes_in_flight_lock:
+        items: List[Dict[str, Any]] = []
+        for flow_id, row in _hermes_in_flight.items():
+            r = {k: v for k, v in row.items() if not str(k).endswith("_mono")}
+            r["flow_id"] = flow_id
+            ts = row.get("turn_start_mono")
+            rs = row.get("run_start_mono")
+            if isinstance(ts, (int, float)):
+                r["since_turn_start_ms"] = int((now - ts) * 1000)
+            if isinstance(rs, (int, float)):
+                r["run_conversation_wait_ms"] = int((now - rs) * 1000)
+            else:
+                r["run_conversation_wait_ms"] = None
+            items.append(r)
+        return items
+
 
 def ollama_openai_base_url() -> str:
     return f"{str(settings.ollama_base_url).rstrip('/')}/v1"
