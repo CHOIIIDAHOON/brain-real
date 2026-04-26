@@ -111,6 +111,10 @@ class Settings:
             "yes",
             "on",
         }
+        # SSE 첫 토큰 지연이 이 값(ms) 초과일 때 hermes_ttfb_warn 이벤트. 0이면 끔.
+        self.hermes_ttfb_warn_ms = int(os.getenv("HERMES_TTFB_WARN_MS", "120000"))
+        # run_conversation가 오래 잡혀 있을 때 N초마다 hermes_heartbeat. 0이면 끔.
+        self.hermes_heartbeat_interval_seconds = int(os.getenv("HERMES_HEARTBEAT_SEC", "30"))
 
 
 settings = Settings()

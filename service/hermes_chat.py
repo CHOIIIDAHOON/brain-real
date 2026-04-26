@@ -56,6 +56,7 @@ def hermes_config_snapshot() -> Dict[str, Any]:
         "hermes_enabled_toolsets": _parse_enabled_toolsets(),
         "hermes_disabled_toolsets": _parse_disabled_toolsets(),
         "hermes_trace_log": getattr(settings, "hermes_trace_log", True),
+        "hermes_heartbeat_sec": int(getattr(settings, "hermes_heartbeat_interval_seconds", 0) or 0),
     }
 
 
@@ -231,12 +232,49 @@ def run_hermes_conversation(
                 "streaming": stream_callback is not None,
             },
         )
-        result = agent.run_conversation(
-            user_message,
-            system_message=system_message,
-            conversation_history=conversation_history,
-            stream_callback=stream_callback,
-        )
+        hb_sec = int(getattr(settings, "hermes_heartbeat_interval_seconds", 30) or 0)
+        stop_heartbeat = threading.Event()
+
+        def _heartbeat_thread_fn() -> None:
+            n = 0
+            while not stop_heartbeat.wait(float(hb_sec)):
+                n += 1
+                w = int((perf_counter() - t_run0) * 1000)
+                write_chat_log(
+                    "hermes_heartbeat",
+                    {
+                        **payload_start,
+                        "build_ms": build_ms,
+                        "wait_ms": w,
+                        "heartbeat_n": n,
+                        "ollama_v1": ollama_openai_base_url(),
+                        "note": "Ollama/툴 응답 대기( thinking 직후 오래 잠잠 = 첫 API 지연·GPU·툴 중 하나)",
+                    },
+                )
+                log_chat_flow(
+                    session_id,
+                    fid,
+                    "Hermes 응답 대기(heartbeat)",
+                    {"wait_ms": w, "n": n},
+                )
+
+        hb_thread: Optional[threading.Thread] = None
+        if hb_sec > 0:
+            hb_thread = threading.Thread(
+                target=_heartbeat_thread_fn,
+                name=f"hermes-hb-{fid[:8]}",
+                daemon=True,
+            )
+            hb_thread.start()
+        try:
+            result = agent.run_conversation(
+                user_message,
+                system_message=system_message,
+                conversation_history=conversation_history,
+                stream_callback=stream_callback,
+            )
+        finally:
+            stop_heartbeat.set()
         run_ms = int((perf_counter() - t_run0) * 1000)
         write_chat_log(
             "hermes_run_conversation_returned",
@@ -391,6 +429,27 @@ def hermes_stream_generator(
                             "model": model,
                         },
                     )
+                    warn_after = int(getattr(settings, "hermes_ttfb_warn_ms", 120_000) or 0)
+                    if warn_after > 0 and first_token_latency_ms >= warn_after:
+                        log_chat_flow(
+                            session_id,
+                            flow_id,
+                            "Hermes 첫 토큰 지연(매우 느림)",
+                            {
+                                "latency_ms": first_token_latency_ms,
+                                "hint": "툴·반복: HERMES_MAX_ITERATIONS↓ HERMES_ENABLED_TOOLSETS(작은 집합) Ollama cold/GPU·Docker 127.0.0.1",
+                            },
+                        )
+                        write_chat_log(
+                            "hermes_ttfb_warn",
+                            {
+                                **base_ctx,
+                                "stream": True,
+                                "latency_ms": first_token_latency_ms,
+                                "warn_threshold_ms": warn_after,
+                                "check_docker_ollama_host": "API 컨테이너는 127.0.0.1≠호스트",
+                            },
+                        )
                 answer_parts.append(text)
                 yield f"data: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
         elif kind == "finished":
