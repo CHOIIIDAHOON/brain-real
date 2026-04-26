@@ -102,6 +102,8 @@ class Settings:
         _hp = os.getenv("HERMES_PLATFORM", "").strip()
         self.hermes_platform = _hp or None
         self.hermes_disabled_toolsets = os.getenv("HERMES_DISABLED_TOOLSETS", "").strip()
+        # 쉼표. 비어 있으면 툴 전부(필터는 disabled와 조합). 지정 시 초기화·툴 수 감소로 첫 응답이 빨라질 수 있음(예: reasoning, web)
+        self.hermes_enabled_toolsets = os.getenv("HERMES_ENABLED_TOOLSETS", "").strip()
 
 
 settings = Settings()

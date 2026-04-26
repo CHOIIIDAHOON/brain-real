@@ -995,6 +995,16 @@ def _process_hermes_chat_request(chat_request, request_info, session_id, flow_id
             ),
         ) from exc
 
+    write_chat_log(
+        "hermes_http_request",
+        {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "new_chat": chat_request.new_chat,
+            "stream": chat_request.stream,
+            **hermes_chat.hermes_config_snapshot(),
+        },
+    )
     log_chat_flow(
         session_id,
         flow_id,
@@ -1030,6 +1040,17 @@ def _process_hermes_chat_request(chat_request, request_info, session_id, flow_id
             persist_hermes_turn(final_text, result)
             log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "ok", "path": "hermes_agent", "stream": True})
 
+        # StreamingResponse: 클라이언트가 SSE body를 읽기 시작한 뒤에만 제너레이터가 돌고 hermes_turn_start가 찍힌다.
+        log_chat_flow(
+            session_id,
+            flow_id,
+            "Hermes 스트리밍 응답 반환(이후 클라이언트 수신 시 턴·툴 로딩이 시작됨)",
+            {
+                "stream": True,
+                "path": "hermes_agent",
+                "client_build": client.get("build", ""),
+            },
+        )
         return StreamingResponse(
             hermes_chat.hermes_stream_generator(
                 user_message=user_message,
@@ -1038,7 +1059,12 @@ def _process_hermes_chat_request(chat_request, request_info, session_id, flow_id
                 model=model_name,
                 session_id=session_id,
                 on_complete=on_complete,
-                log_context={"session_id": session_id, "model": model_name, "flow_id": flow_id},
+                log_context={
+                    "session_id": session_id,
+                    "model": model_name,
+                    "flow_id": flow_id,
+                    **hermes_chat.hermes_config_snapshot(),
+                },
             ),
             media_type="text/event-stream; charset=utf-8",
             headers={
@@ -1059,16 +1085,18 @@ def _process_hermes_chat_request(chat_request, request_info, session_id, flow_id
             conversation_history=conversation_history,
             model=model_name,
             session_id=session_id,
+            flow_id=flow_id,
         )
         answer = normalize_answer_text(result.get("final_response", ""))
         write_chat_log(
-            "chat_http_response",
+            "hermes_http_response",
             {
                 "session_id": session_id,
                 "flow_id": flow_id,
                 "model": model_name,
                 "stream": False,
-                "answer": answer,
+                "answer_preview": hermes_chat.hermes_answer_preview(answer, 500),
+                "result_messages_persisted": len(result.get("messages") or []),
             },
         )
         persist_hermes_turn(answer, result)
@@ -1081,9 +1109,17 @@ def _process_hermes_chat_request(chat_request, request_info, session_id, flow_id
             "session_id": session_id,
         }
     except Exception as exc:
+        import traceback
+
         write_chat_log(
             "hermes_conversation_error",
-            {"session_id": session_id, "flow_id": flow_id, "error": str(exc)},
+            {
+                "session_id": session_id,
+                "flow_id": flow_id,
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+                **hermes_chat.hermes_config_snapshot(),
+            },
         )
         log_chat_flow(session_id, flow_id, "요청 처리 종료", {"status": "error", "path": "hermes_agent", "error": str(exc)})
         raise HTTPException(status_code=500, detail=f"Hermes conversation error: {exc}") from exc

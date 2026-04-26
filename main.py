@@ -18,8 +18,13 @@ async def _lifespan(_app: FastAPI):
                 "Recreate the venv with `python3.12 -m venv .venv` or set CHAT_BACKEND=ollama in .env."
             )
         from service import hermes_chat
+        from service.chat_service import write_chat_log
 
         hermes_chat.ensure_hermes_import()
+        write_chat_log(
+            "hermes_app_startup_ok",
+            {"python": sys.version, "ollama_model": settings.ollama_model, **hermes_chat.hermes_config_snapshot()},
+        )
     yield
 
 

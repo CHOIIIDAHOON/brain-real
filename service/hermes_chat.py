@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import threading
+import traceback
 from datetime import datetime
 from queue import Queue
 from time import perf_counter
@@ -19,11 +20,42 @@ def ollama_openai_base_url() -> str:
     return f"{str(settings.ollama_base_url).rstrip('/')}/v1"
 
 
+def _user_text_preview(text: str, max_chars: int = 160) -> str:
+    t = (text or "").replace("\n", " ").strip()
+    if len(t) <= max_chars:
+        return t
+    return t[: max_chars - 3] + "..."
+
+
+def hermes_answer_preview(text: str, max_chars: int = 500) -> str:
+    """로그용 답변 미리보기(전체 답은 CHAT_LOG에 과하게 남기지 않음)."""
+    return _user_text_preview(text, max_chars)
+
+
 def _parse_disabled_toolsets() -> Optional[List[str]]:
     raw = (getattr(settings, "hermes_disabled_toolsets", None) or "").strip()
     if not raw:
         return None
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _parse_enabled_toolsets() -> Optional[List[str]]:
+    raw = (getattr(settings, "hermes_enabled_toolsets", None) or "").strip()
+    if not raw:
+        return None
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def hermes_config_snapshot() -> Dict[str, Any]:
+    return {
+        "ollama_v1_url": ollama_openai_base_url(),
+        "hermes_max_iterations": settings.hermes_max_iterations,
+        "hermes_skip_memory": settings.hermes_skip_memory,
+        "hermes_skip_context_files": settings.hermes_skip_context_files,
+        "hermes_platform": settings.hermes_platform,
+        "hermes_enabled_toolsets": _parse_enabled_toolsets(),
+        "hermes_disabled_toolsets": _parse_disabled_toolsets(),
+    }
 
 
 def ensure_hermes_import() -> None:
@@ -50,6 +82,7 @@ def _build_agent(
         skip_memory=settings.hermes_skip_memory,
         ephemeral_system_prompt=ephemeral_system_prompt,
         platform=settings.hermes_platform,
+        enabled_toolsets=_parse_enabled_toolsets(),
         disabled_toolsets=_parse_disabled_toolsets(),
     )
 
@@ -62,18 +95,99 @@ def run_hermes_conversation(
     model: str,
     session_id: str,
     stream_callback: Optional[Callable[[str], None]] = None,
+    flow_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    agent = _build_agent(
-        model=model,
-        session_id=session_id,
-        ephemeral_system_prompt=None,
+    from service.chat_service import log_chat_flow, write_chat_log
+
+    fid = flow_id or "n/a"
+    payload_start = {
+        **hermes_config_snapshot(),
+        "session_id": session_id,
+        "flow_id": fid,
+        "model": model,
+        "user_message_chars": len(user_message or ""),
+        "user_message_preview": _user_text_preview(user_message),
+        "has_system_message": bool((system_message or "").strip()),
+        "history_message_count": len(conversation_history or []),
+        "streaming": stream_callback is not None,
+    }
+    write_chat_log("hermes_turn_start", payload_start)
+    log_chat_flow(
+        session_id,
+        fid,
+        "Hermes turn 시작",
+        {"model": model, "streaming": stream_callback is not None, "history_messages": len(conversation_history or [])},
     )
-    return agent.run_conversation(
-        user_message,
-        system_message=system_message,
-        conversation_history=conversation_history,
-        stream_callback=stream_callback,
+    started = perf_counter()
+    try:
+        t_build0 = perf_counter()
+        agent = _build_agent(
+            model=model,
+            session_id=session_id,
+            ephemeral_system_prompt=None,
+        )
+        build_ms = int((perf_counter() - t_build0) * 1000)
+        write_chat_log("hermes_agent_built", {**payload_start, "build_ms": build_ms})
+        log_chat_flow(
+            session_id,
+            fid,
+            "Hermes AIAgent 초기화 끝",
+            {"build_ms": build_ms, "hint": "툴/클라이언트 로딩. 오래 걸리면 HERMES_ENABLED_TOOLSETS로 툴을 줄이세요."},
+        )
+        t_run0 = perf_counter()
+        result = agent.run_conversation(
+            user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            stream_callback=stream_callback,
+        )
+        run_ms = int((perf_counter() - t_run0) * 1000)
+        write_chat_log(
+            "hermes_run_conversation_returned",
+            {**payload_start, "run_conversation_ms": run_ms, "build_ms": build_ms},
+        )
+    except Exception as exc:
+        elapsed_ms = int((perf_counter() - started) * 1000)
+        write_chat_log(
+            "hermes_turn_error",
+            {
+                **payload_start,
+                "elapsed_ms": elapsed_ms,
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+            },
+        )
+        log_chat_flow(
+            session_id,
+            fid,
+            "Hermes turn 실패",
+            {"error": str(exc), "elapsed_ms": elapsed_ms},
+        )
+        raise
+
+    elapsed_ms = int((perf_counter() - started) * 1000)
+    messages = result.get("messages") if isinstance(result, dict) else None
+    final_text = (result.get("final_response") or "") if isinstance(result, dict) else ""
+    write_chat_log(
+        "hermes_turn_complete",
+        {
+            **payload_start,
+            "elapsed_ms": elapsed_ms,
+            "final_response_chars": len(final_text),
+            "result_messages_count": len(messages) if isinstance(messages, list) else None,
+        },
     )
+    log_chat_flow(
+        session_id,
+        fid,
+        "Hermes turn 완료",
+        {
+            "elapsed_ms": elapsed_ms,
+            "final_response_chars": len(final_text),
+            "result_messages": len(messages) if isinstance(messages, list) else 0,
+        },
+    )
+    return result
 
 
 def hermes_stream_generator(
@@ -99,6 +213,7 @@ def hermes_stream_generator(
     q: Queue = Queue()
     result_holder: list = []
     flow_id = str((log_context or {}).get("flow_id", "n/a"))
+    base_ctx = {**(log_context or {}), **hermes_config_snapshot()}
 
     def work():
         try:
@@ -109,14 +224,33 @@ def hermes_stream_generator(
                 model=model,
                 session_id=session_id,
                 stream_callback=lambda t: q.put(("delta", t)),
+                flow_id=flow_id,
             )
             result_holder.append(result)
             q.put(("finished", None))
         except Exception as e:
+            write_chat_log(
+                "hermes_stream_worker_error",
+                {
+                    **base_ctx,
+                    "session_id": session_id,
+                    "flow_id": flow_id,
+                    "error": repr(e),
+                    "traceback": traceback.format_exc(),
+                },
+            )
             q.put(("error", str(e)))
 
     started_time = perf_counter()
-    log_chat_flow(session_id, flow_id, "Hermes LLM 호출 시작", {"stream": True, "path": "hermes_agent"})
+    write_chat_log(
+        "hermes_stream_sse_start",
+        {
+            **base_ctx,
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "model": model,
+        },
+    )
 
     thread = threading.Thread(target=work, daemon=True)
     thread.start()
@@ -134,22 +268,32 @@ def hermes_stream_generator(
                 if first_token_latency_ms is None:
                     first_token_latency_ms = int((now - started_time) * 1000)
                     write_chat_log(
-                        "chat_stream_first_token",
-                        {**(log_context or {}), "latency_ms": first_token_latency_ms, "backend": "hermes"},
+                        "hermes_stream_first_token",
+                        {
+                            **base_ctx,
+                            "stream": True,
+                            "latency_ms": first_token_latency_ms,
+                            "model": model,
+                        },
                     )
                 answer_parts.append(text)
                 yield f"data: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
         elif kind == "finished":
             break
         elif kind == "error":
-            write_chat_log("hermes_stream_error", {**(log_context or {}), "stream": True, "error": item[1]})
-            yield f"event: error\ndata: {json.dumps({'error': item[1]}, ensure_ascii=False)}\n\n"
+            err_msg = item[1] if len(item) > 1 else ""
+            write_chat_log(
+                "hermes_stream_sse_error",
+                {**base_ctx, "stream": True, "error": err_msg},
+            )
+            log_chat_flow(session_id, flow_id, "Hermes SSE 중단", {"error": err_msg, "stream": True})
+            yield f"event: error\ndata: {json.dumps({'error': err_msg}, ensure_ascii=False)}\n\n"
             return
         else:
             continue
 
     if not result_holder:
-        write_chat_log("hermes_stream_missing_result", {**(log_context or {}), "stream": True})
+        write_chat_log("hermes_stream_missing_result", {**base_ctx, "stream": True})
         yield f"event: error\ndata: {json.dumps({'error': 'hermes: empty result'}, ensure_ascii=False)}\n\n"
         return
 
@@ -161,20 +305,30 @@ def hermes_stream_generator(
         on_complete(final_text, result)
     done_ms = int((perf_counter() - started_time) * 1000)
     write_chat_log(
-        "chat_stream_timing",
+        "hermes_stream_timing",
         {
-            **(log_context or {}),
+            **base_ctx,
             "stream": True,
             "total_latency_ms": done_ms,
             "first_token_latency_ms": first_token_latency_ms,
-            "chunk_count": len(answer_parts),
-            "answer_chars": len(final_text),
-            "backend": "hermes",
+            "stream_delta_events": len(answer_parts),
+            "final_response_chars": len(final_text),
+            "model": model,
         },
     )
-    log_chat_flow(session_id, flow_id, "LLM 응답 완료", {"stream": True, "path": "hermes_agent"})
+    log_chat_flow(
+        session_id,
+        flow_id,
+        "Hermes 응답 전송 완료(SSE)",
+        {"stream": True, "total_latency_ms": done_ms, "final_response_chars": len(final_text)},
+    )
     write_chat_log(
-        "chat_http_response",
-        {**(log_context or {}), "stream": True, "answer": final_text, "wall_ended": datetime.now(korean_timezone).isoformat()},
+        "hermes_stream_response",
+        {
+            **base_ctx,
+            "stream": True,
+            "answer_preview": hermes_answer_preview(final_text, 500),
+            "wall_ended": datetime.now(korean_timezone).isoformat(),
+        },
     )
     yield "event: done\ndata: [DONE]\n\n"
