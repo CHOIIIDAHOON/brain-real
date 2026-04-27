@@ -10,7 +10,7 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from config import settings
 from service import ollama_client
@@ -275,7 +275,7 @@ def _read_recent_pending_md_text(max_age_seconds: int) -> str:
 
 
 def build_hybrid_memory_context(user_message: str, session_id: str, flow_id: str) -> str:
-    if not settings.hybrid_memory_enabled:
+    if not settings.hybrid_memory_enabled and not settings.chroma_memory_persist_enabled:
         return ""
     n = settings.hybrid_memory_search_n
     db_rows = _chroma_query(user_message, n)
@@ -305,40 +305,40 @@ def build_hybrid_memory_context(user_message: str, session_id: str, flow_id: str
     return "\n".join(lines)
 
 
-# --- public: after each assistant turn ---
+# --- Ollama 메모리 판단 add → Chroma + pending(동기화 스크립트 호환) ---
 
 
-def _infer_title_tags_from_user(user_message: str) -> Tuple[str, List[str]]:
-    line = (user_message or "").strip().split("\n")[0].strip()
-    title = line[:80] if line else "turn"
-    return title, []
-
-
-def log_pending_after_turn(
+def persist_memory_decision_add(
     *,
     user_message: str,
     answer: str,
-    decision: Optional[Dict[str, Any]] = None,
+    decision: Dict[str, Any],
     session_id: str = "",
     flow_id: str = "",
 ) -> None:
-    if not settings.hybrid_memory_enabled:
+    """
+    메모리_판단 action=add 시에만: 팩트 요약·태그·제목을 nomic으로 임베딩해 Chroma에 upsert,
+    pending .md(답변 본문)는 동기화·1시간 맥락용.
+    """
+    if not settings.chroma_memory_persist_enabled:
         return
     if not (answer or "").strip():
         return
-    ensure_dirs()
-    d = decision or {}
-    if d.get("action") == "add" and d.get("title"):
-        title = (d.get("title") or "").strip() or "memory"
-        tags = d.get("tags") if isinstance(d.get("tags"), list) else []
-        tags = [str(t) for t in tags][:10]
-    else:
-        title, tags = _infer_title_tags_from_user(user_message)
+    title = (decision.get("title") or "").strip() or "memory"
+    tags = decision.get("tags") if isinstance(decision.get("tags"), list) else []
+    tags = [str(t) for t in tags][:10]
+    content = (decision.get("content") or "").strip()
+    if not content:
+        content = f"{user_message}\n{answer}".strip()[:2000]
 
+    ensure_dirs()
     date_str = datetime.now(_kst).strftime("%Y-%m-%d")
     base_slug = _filename_slug(title)
     chroma_doc_id = str(uuid.uuid4())
-    embed_str = f"{title}\n" + (", ".join(tags) if tags else "")
+    # 검색/임베딩: 제목·태그·요약 본문
+    embed_str = f"{title}\n{', '.join(tags) if tags else ''}\n{content}"
+    # 컬렉션 문서 표시용
+    document_for_chroma = f"{title}\n{content}\n\n[assistant]\n{answer.strip()[:6000]}"
     file_body = _build_file_content(
         title=title,
         tags=tags,
@@ -347,8 +347,7 @@ def log_pending_after_turn(
         body=answer.strip(),
     )
     out_dir = _pending_dir()
-    filename = f"{date_str}_{base_slug}.md"
-    out_path = out_dir / filename
+    out_path = out_dir / f"{date_str}_{base_slug}.md"
     suffix = 0
     while out_path.exists():
         suffix += 1
@@ -360,8 +359,8 @@ def log_pending_after_turn(
         return
 
     doc_meta: Dict[str, Any] = {
-        "title": title,
-        "source": "hybrid_pending_light",
+        "title": title[:2000],
+        "source": "memory_decision_add",
         "session_id": session_id or "",
         "path": out_path.name,
         "flow_id": flow_id or "",
@@ -373,11 +372,11 @@ def log_pending_after_turn(
     ok = _chroma_upsert_light(
         chroma_doc_id=chroma_doc_id,
         embed_text=embed_str,
-        document_body=answer.strip(),
+        document_body=document_for_chroma[:8000],
         metadata=doc_meta,
     )
     _wlog(
-        "chroma_즉시저장",
+        "chroma_메모리저장",
         {
             "path": out_path.name,
             "chroma_ok": ok,

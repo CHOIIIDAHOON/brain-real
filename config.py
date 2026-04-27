@@ -99,6 +99,13 @@ class Settings:
         self.hybrid_memory_chroma_collection = os.getenv("HYBRID_MEMORY_CHROMA_COLLECTION", "hybrid_memory")
         self.hybrid_memory_search_n = int(os.getenv("HYBRID_MEMORY_SEARCH_N", "5"))
         self.hybrid_memory_pending_max_age_seconds = int(os.getenv("HYBRID_MEMORY_PENDING_MAX_AGE_SECONDS", "3600"))
+        # Ollama 메모리_판단 add 시: nomic 임베딩 + hybrid_memory 컬렉션 + pending .md. false + CHAT_MEMORY=true면 예전 RAM 메모리_저장.
+        self.chroma_memory_persist_enabled = os.getenv("CHROMA_MEMORY_PERSIST_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
 
 settings = Settings()

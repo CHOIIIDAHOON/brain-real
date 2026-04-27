@@ -77,7 +77,16 @@ def _log_text_preview(text, max_chars=500):
 
 # 채팅 1회 요청(들어온 질의·모델·맥락 여부) — 판단·저장·Chroma는 별도 이벤트.
 def log_chat_request_summary(
-    session_id, flow_id, *, user_message, stream, model, new_chat, memory_context_applied, hybrid_on
+    session_id,
+    flow_id,
+    *,
+    user_message,
+    stream,
+    model,
+    new_chat,
+    memory_context_applied,
+    hybrid_on,
+    chroma_rag: bool = False,
 ):
     write_chat_log(
         "채팅_요청",
@@ -90,6 +99,7 @@ def log_chat_request_summary(
             "new_chat": new_chat,
             "memory_context": bool(memory_context_applied),
             "hybrid": bool(hybrid_on),
+            "chroma_rag": bool(chroma_rag),
         },
     )
 
@@ -119,7 +129,11 @@ def memory_worker_loop():
             model = str(task.get("model", ""))
             flow_id = str(task.get("flow_id", "")) or None
             decision = None
-            if settings.chat_memory_store_enabled or settings.hybrid_memory_enabled:
+            if (
+                settings.chat_memory_store_enabled
+                or settings.hybrid_memory_enabled
+                or settings.chroma_memory_persist_enabled
+            ):
                 cooldown_seconds = settings.chat_memory_session_cooldown_seconds
                 now = perf_counter()
                 skip_decision = False
@@ -138,16 +152,6 @@ def memory_worker_loop():
                         model=model,
                         flow_id=flow_id,
                     )
-            if settings.hybrid_memory_enabled:
-                from service import hybrid_memory_service
-
-                hybrid_memory_service.log_pending_after_turn(
-                    user_message=user_message,
-                    answer=answer,
-                    decision=decision,
-                    session_id=session_id,
-                    flow_id=flow_id or "",
-                )
         except Exception as exception:
             write_chat_log("post_turn_워커_오류", {"error": str(exception), "task": task})
         finally:
@@ -413,9 +417,13 @@ def decide_memory_with_ollama(model, user_message, answer, session_id=None, flow
     return parsed_decision
 
 
-# 응답 완료 후: Ollama 판단 + (하이브리드가 끄면) 인메모리 저장. 하이브리드만 쓰면 Chroma·pending이 주 저장소.
+# 응답 완료 후: Ollama 판단 → add 시 Chroma(기본) 또는(레거시) 인메모리 RAM.
 def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=None):
-    if not settings.chat_memory_store_enabled and not settings.hybrid_memory_enabled:
+    if not (
+        settings.chat_memory_store_enabled
+        or settings.hybrid_memory_enabled
+        or settings.chroma_memory_persist_enabled
+    ):
         return None
     if settings.chat_memory_decision_mode.lower() != "ollama":
         write_chat_log(
@@ -466,6 +474,25 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
         return decision
 
     content = decision["content"] or f"{user_message}\n{answer}"
+
+    if settings.chroma_memory_persist_enabled:
+        from service.hybrid_memory_service import persist_memory_decision_add
+
+        try:
+            persist_memory_decision_add(
+                user_message=user_message,
+                answer=answer,
+                decision=decision,
+                session_id=session_id,
+                flow_id=flow_id or "",
+            )
+        except Exception as exc:
+            write_chat_log(
+                "chroma_메모리_저장_오류",
+                {"error": str(exc), "session_id": session_id, "flow_id": flow_id},
+            )
+        return decision
+
     if settings.chat_memory_store_enabled and not settings.hybrid_memory_enabled:
         if is_duplicate_memory(content, session_id=session_id, flow_id=flow_id):
             write_chat_log(
@@ -473,8 +500,6 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
                 {"session_id": session_id, "flow_id": flow_id, "reason": "duplicate"},
             )
             return decision
-
-    if settings.chat_memory_store_enabled and not settings.hybrid_memory_enabled:
         title = decision["title"] or user_message.strip().replace("\n", " ")[:50] or "chat_memory"
         save_stored_memory(
             title=title,
@@ -488,9 +513,13 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
     return decision
 
 
-# post-turn(인메모리 저장 + 하이브리드 pending·Chroma)를 큐에 넣는다. 하이브리드는 쿨다운과 무관하게 항상 큐에 들어가 처리된다.
+# post-turn(Ollama 판단 + Chroma 저장 또는 레거시 RAM).
 def schedule_memory_store(session_id, user_message, answer, model, flow_id=None):
-    if not settings.chat_memory_store_enabled and not settings.hybrid_memory_enabled:
+    if not (
+        settings.chat_memory_store_enabled
+        or settings.hybrid_memory_enabled
+        or settings.chroma_memory_persist_enabled
+    ):
         return
     ensure_memory_worker()
     task = {
@@ -638,7 +667,9 @@ def process_chat_request(chat_request, request_info):
     if settings.chat_memory_context_first_turn_only and len(history) > 0:
         use_memory_context = False
     memory_context = ""
-    if use_memory_context and settings.hybrid_memory_enabled:
+    if use_memory_context and (
+        settings.hybrid_memory_enabled or settings.chroma_memory_persist_enabled
+    ):
         from service.hybrid_memory_service import build_hybrid_memory_context
 
         memory_context = build_hybrid_memory_context(
@@ -685,6 +716,10 @@ def process_chat_request(chat_request, request_info):
         new_chat=chat_request.new_chat,
         memory_context_applied=bool(memory_context),
         hybrid_on=settings.hybrid_memory_enabled,
+        chroma_rag=bool(
+            use_memory_context
+            and (settings.hybrid_memory_enabled or settings.chroma_memory_persist_enabled)
+        ),
     )
 
     if chat_request.stream:
