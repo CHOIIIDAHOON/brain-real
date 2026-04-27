@@ -28,7 +28,8 @@ class Settings:
         self.ollama_timeout_seconds = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
         cors_origins = os.getenv(
             "CORS_ALLOW_ORIGINS",
-            "http://localhost:3000,http://localhost:5000,http://localhost:8000,http://127.0.0.1:3000,http://127.0.0.1:5000,http://127.0.0.1:8000",
+            "http://localhost:3000,http://localhost:5000,http://localhost:50055,http://localhost:8000,"
+            "http://127.0.0.1:3000,http://127.0.0.1:5000,http://127.0.0.1:50055,http://127.0.0.1:8000",
         )
         self.cors_allow_origins = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
         self.cors_allow_origin_regex = os.getenv(
