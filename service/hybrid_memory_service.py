@@ -210,7 +210,7 @@ def _chroma_query(user_question: str, n_results: int) -> List[Dict[str, Any]]:
             model=settings.ollama_embed_model,
         )
     except Exception as exc:
-        _wlog("hybrid_chroma_query_embed_error", {"error": str(exc)})
+        _wlog("chroma_검색_오류", {"phase": "embed_query", "error": str(exc)})
         return []
     try:
         res = col.query(
@@ -218,7 +218,7 @@ def _chroma_query(user_question: str, n_results: int) -> List[Dict[str, Any]]:
             n_results=min(max(1, n_results), 50),
         )
     except Exception as exc:
-        _wlog("hybrid_chroma_query_error", {"error": str(exc)})
+        _wlog("chroma_검색_오류", {"phase": "chroma_query", "error": str(exc)})
         return []
     rows: List[Dict[str, Any]] = []
     ids = res.get("ids", [[]])[0]
@@ -302,15 +302,6 @@ def build_hybrid_memory_context(user_message: str, session_id: str, flow_id: str
         lines.append("## 최근 1시간 이내 pending 기록(원문)\n(해당 없음)")
 
     lines.append("[/HYBRID_MEMORY_CONTEXT]")
-    _wlog(
-        "hybrid_memory_context_built",
-        {
-            "session_id": session_id,
-            "flow_id": flow_id,
-            "chroma_hits": len(db_rows),
-            "recent_md_chars": len(recent_text),
-        },
-    )
     return "\n".join(lines)
 
 
@@ -365,7 +356,7 @@ def log_pending_after_turn(
     try:
         out_path.write_text(file_body, encoding="utf-8")
     except OSError as exc:
-        _wlog("hybrid_pending_write_error", {"error": str(exc), "path": str(out_path)})
+        _wlog("chroma_pending_쓰기_오류", {"error": str(exc), "path": str(out_path)})
         return
 
     doc_meta: Dict[str, Any] = {
@@ -386,9 +377,9 @@ def log_pending_after_turn(
         metadata=doc_meta,
     )
     _wlog(
-        "hybrid_immediate_log",
+        "chroma_즉시저장",
         {
-            "path": str(out_path),
+            "path": out_path.name,
             "chroma_ok": ok,
             "chroma_doc_id": chroma_doc_id,
             "title": title,
@@ -454,7 +445,7 @@ def sync_pending_to_archive() -> Dict[str, Any]:
             dest.write_text(new_content, encoding="utf-8")
             path.unlink(missing_ok=True)
             processed.append(str(dest))
-            _wlog("hybrid_sync_archived", {"from": str(path), "to": str(dest), "chroma_doc_id": doc_id})
+            _wlog("chroma_동기화_아카이브", {"from": path.name, "to": dest.name, "chroma_doc_id": doc_id})
         except Exception as exc:
             errors.append({"file": str(path), "error": str(exc)})
     return {"ok": not errors, "processed": processed, "errors": errors}
