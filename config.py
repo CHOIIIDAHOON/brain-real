@@ -84,6 +84,21 @@ class Settings:
             "on",
         }
         self.chat_log_path = os.getenv("CHAT_LOG_PATH", "./logs/chat_events.jsonl")
+        # 하이브리드 AI 메모리: pending .md + Chroma(nomic) + 1시간 이내 파일 맥락
+        self.hybrid_memory_enabled = os.getenv("HYBRID_MEMORY_ENABLED", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.hybrid_memory_pending_path = os.getenv("HYBRID_MEMORY_PENDING_PATH", "/data/logs/pending")
+        self.hybrid_memory_archive_path = os.getenv("HYBRID_MEMORY_ARCHIVE_PATH", "/data/logs/archive")
+        self.ollama_embed_model = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+        # 최종 응답이 사용할 모델(미지정이면 OLLAMA_MODEL과 동일)
+        self.hybrid_memory_llm_model = os.getenv("HYBRID_MEMORY_LLM_MODEL", "").strip() or self.ollama_model
+        self.hybrid_memory_chroma_collection = os.getenv("HYBRID_MEMORY_CHROMA_COLLECTION", "hybrid_memory")
+        self.hybrid_memory_search_n = int(os.getenv("HYBRID_MEMORY_SEARCH_N", "5"))
+        self.hybrid_memory_pending_max_age_seconds = int(os.getenv("HYBRID_MEMORY_PENDING_MAX_AGE_SECONDS", "3600"))
 
 
 settings = Settings()

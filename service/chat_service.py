@@ -17,7 +17,7 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from config import settings
-from service import chat_memory_store
+from service import chat_memory_store, ollama_client
 
 chat_sessions = {}
 max_session_turns = 20
@@ -195,20 +195,61 @@ def log_chat_flow(session_id, flow_id, step_name, data=None):
     )
 
 
-# 백그라운드 메모리 저장 워커를 실행한다.
+# 백그라운드 post-turn(인메모리 메모리 + 하이브리드 pending) 워커.
 def memory_worker_loop():
     while True:
         task = memory_task_queue.get()
         try:
-            maybe_store_global_memory(
-                session_id=str(task.get("session_id", "")),
-                user_message=str(task.get("user_message", "")),
-                answer=str(task.get("answer", "")),
-                model=str(task.get("model", "")),
-                flow_id=str(task.get("flow_id", "")),
-            )
+            session_id = str(task.get("session_id", ""))
+            user_message = str(task.get("user_message", ""))
+            answer = str(task.get("answer", ""))
+            model = str(task.get("model", ""))
+            flow_id = str(task.get("flow_id", "")) or None
+            decision = None
+            if settings.chat_memory_store_enabled:
+                cooldown_seconds = settings.chat_memory_session_cooldown_seconds
+                now = perf_counter()
+                skip_memory = False
+                if cooldown_seconds > 0:
+                    with memory_schedule_lock:
+                        last_time = session_last_memory_schedule_time.get(session_id)
+                        if last_time is not None and (now - last_time) < cooldown_seconds:
+                            remaining_ms = int(
+                                (cooldown_seconds - (now - last_time)) * 1000,
+                            )
+                            skip_memory = True
+                            write_chat_log(
+                                "메모리 저장 생략",
+                                {
+                                    "session_id": session_id,
+                                    "flow_id": flow_id,
+                                    "reason": "session_cooldown",
+                                    "cooldown_seconds": cooldown_seconds,
+                                    "remaining_ms": max(remaining_ms, 0),
+                                },
+                            )
+                        else:
+                            session_last_memory_schedule_time[session_id] = now
+                if not skip_memory:
+                    decision = maybe_store_global_memory(
+                        session_id=session_id,
+                        user_message=user_message,
+                        answer=answer,
+                        model=model,
+                        flow_id=flow_id,
+                    )
+            if settings.hybrid_memory_enabled:
+                from service import hybrid_memory_service
+
+                hybrid_memory_service.log_pending_after_turn(
+                    user_message=user_message,
+                    answer=answer,
+                    decision=decision,
+                    session_id=session_id,
+                    flow_id=flow_id or "",
+                )
         except Exception as exception:
-            write_chat_log("메모리 워커 오류", {"error": str(exception), "task": task})
+            write_chat_log("post_turn_워커_오류", {"error": str(exception), "task": task})
         finally:
             memory_task_queue.task_done()
 
@@ -463,10 +504,12 @@ def decide_memory_with_ollama(model, user_message, answer, session_id=None, flow
         "prompt": decision_prompt,
         "stream": False,
         "keep_alive": settings.ollama_keep_alive,
-        "options": {
-            "temperature": 0,
-            "num_predict": settings.chat_memory_decision_num_predict,
-        },
+        "options": ollama_client.ollama_thread_options(
+            {
+                "temperature": 0,
+                "num_predict": settings.chat_memory_decision_num_predict,
+            }
+        ),
     }
     write_chat_log(
         "저장 판단 API 요청",
@@ -514,10 +557,10 @@ def decide_memory_with_ollama(model, user_message, answer, session_id=None, flow
     return parsed_decision
 
 
-# 응답 완료 후 메모리 저장 파이프라인을 실행한다.
+# 응답 완료 후 메모리 저장 파이프라인을 실행한다. 판단 결과 dict 또는 None(미실행/스킵)을 반환한다.
 def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=None):
     if not settings.chat_memory_store_enabled:
-        return
+        return None
     if settings.chat_memory_decision_mode.lower() != "ollama":
         write_chat_log(
             "메모리 저장 생략",
@@ -528,20 +571,20 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
                 "mode": settings.chat_memory_decision_mode,
             },
         )
-        return
+        return None
     if not answer.strip():
         write_chat_log(
             "메모리 저장 생략",
             {"session_id": session_id, "flow_id": flow_id, "reason": "empty_answer"},
         )
-        return
+        return None
     skip_reason = should_skip_memory_decision(user_message=user_message, answer=answer)
     if skip_reason:
         write_chat_log(
             "메모리 저장 생략",
             {"session_id": session_id, "flow_id": flow_id, "reason": skip_reason},
         )
-        return
+        return None
 
     decision_model = settings.chat_memory_decision_model or model
     try:
@@ -563,7 +606,7 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
             "메모리 저장 생략",
             {"session_id": session_id, "flow_id": flow_id, "reason": "decision_error", "error": str(exception)},
         )
-        return
+        return None
 
     log_chat_flow(
         session_id,
@@ -594,7 +637,7 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
             "메모리 저장 생략",
             {"session_id": session_id, "flow_id": flow_id, "reason": "decision_skip", "decision": decision},
         )
-        return
+        return decision
 
     content = decision["content"] or f"{user_message}\n{answer}"
     if is_duplicate_memory(content, session_id=session_id, flow_id=flow_id):
@@ -602,7 +645,7 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
             "메모리 저장 생략",
             {"session_id": session_id, "flow_id": flow_id, "reason": "duplicate", "content_preview": content[:200]},
         )
-        return
+        return decision
 
     title = decision["title"] or user_message.strip().replace("\n", " ")[:50] or "chat_memory"
     log_chat_flow(session_id, flow_id or "n/a", "메모리 저장 시작", {"title": title})
@@ -631,33 +674,14 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
         "메모리 저장 끝",
         {"memory_id": memory_row.get("memory_id")},
     )
+    return decision
 
 
-# 메모리 저장 작업을 큐에 안전하게 등록한다.
+# post-turn(인메모리 저장 + 하이브리드 pending·Chroma)를 큐에 넣는다. 하이브리드는 쿨다운과 무관하게 항상 큐에 들어가 처리된다.
 def schedule_memory_store(session_id, user_message, answer, model, flow_id=None):
-    if not settings.chat_memory_store_enabled:
+    if not settings.chat_memory_store_enabled and not settings.hybrid_memory_enabled:
         return
     ensure_memory_worker()
-    cooldown_seconds = settings.chat_memory_session_cooldown_seconds
-    now = perf_counter()
-    if cooldown_seconds > 0:
-        with memory_schedule_lock:
-            last_scheduled_time = session_last_memory_schedule_time.get(session_id)
-            if last_scheduled_time is not None and (now - last_scheduled_time) < cooldown_seconds:
-                remaining_milliseconds = int((cooldown_seconds - (now - last_scheduled_time)) * 1000)
-                write_chat_log(
-                    "메모리 저장 생략",
-                    {
-                        "session_id": session_id,
-                        "flow_id": flow_id,
-                        "reason": "session_cooldown",
-                        "cooldown_seconds": cooldown_seconds,
-                        "remaining_ms": max(remaining_milliseconds, 0),
-                    },
-                )
-                return
-            session_last_memory_schedule_time[session_id] = now
-
     task = {
         "session_id": session_id,
         "flow_id": flow_id or "",
@@ -666,18 +690,19 @@ def schedule_memory_store(session_id, user_message, answer, model, flow_id=None)
         "answer": answer,
     }
     write_chat_log(
-        "memory_store_scheduled",
+        "post_turn_scheduled",
         {
             "session_id": session_id,
             "flow_id": flow_id,
             "model": model,
-            "user_message": user_message,
             "queue_size_before": memory_task_queue.qsize(),
+            "chat_memory": settings.chat_memory_store_enabled,
+            "hybrid": settings.hybrid_memory_enabled,
         },
     )
     memory_task_queue.put(task)
     write_chat_log(
-        "memory_store_enqueued",
+        "post_turn_enqueued",
         {"session_id": session_id, "flow_id": flow_id, "queue_size_after": memory_task_queue.qsize()},
     )
 
@@ -1002,7 +1027,17 @@ def process_chat_request(chat_request, request_info):
     use_memory_context = True
     if settings.chat_memory_context_first_turn_only and len(history) > 0:
         use_memory_context = False
-    memory_context = build_memory_context(session_id=session_id, flow_id=flow_id) if use_memory_context else ""
+    memory_context = ""
+    if use_memory_context and settings.hybrid_memory_enabled:
+        from service.hybrid_memory_service import build_hybrid_memory_context
+
+        memory_context = build_hybrid_memory_context(
+            user_message=chat_request.message,
+            session_id=session_id,
+            flow_id=flow_id,
+        )
+    elif use_memory_context and settings.chat_memory_store_enabled:
+        memory_context = build_memory_context(session_id=session_id, flow_id=flow_id)
     if memory_context:
         prompt = f"{memory_context}\n\n{prompt}"
     log_chat_flow(
@@ -1026,10 +1061,17 @@ def process_chat_request(chat_request, request_info):
     )
 
     ollama_url = f"{settings.ollama_base_url}/api/generate"
+    if chat_request.model:
+        effective_model = chat_request.model
+    elif settings.hybrid_memory_enabled:
+        effective_model = settings.hybrid_memory_llm_model
+    else:
+        effective_model = settings.ollama_model
     payload = {
-        "model": chat_request.model or settings.ollama_model,
+        "model": effective_model,
         "prompt": prompt,
         "stream": chat_request.stream,
+        "options": ollama_client.ollama_thread_options(),
     }
     system_prompt = chat_request.system_prompt or settings.default_system_prompt
     if system_prompt:
