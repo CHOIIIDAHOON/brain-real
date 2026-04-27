@@ -57,8 +57,12 @@ def _get_collection():
 
 def ensure_dirs() -> None:
     for path_str in (settings.hybrid_memory_pending_path, settings.hybrid_memory_archive_path):
-        if path_str:
+        if not path_str:
+            continue
+        try:
             os.makedirs(path_str, exist_ok=True)
+        except OSError as exc:
+            _wlog("hybrid_디렉터리_생성_실패", {"path": path_str, "error": str(exc)})
 
 
 # --- front matter (simple YAML subset) ---
@@ -397,7 +401,15 @@ def sync_pending_to_archive() -> Dict[str, Any]:
     ensure_dirs()
     pending = _pending_dir()
     archive = Path(settings.hybrid_memory_archive_path)
-    archive.mkdir(parents=True, exist_ok=True)
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "processed": [],
+            "errors": [{"path": str(archive), "error": str(exc)}],
+            "message": "archive_dir_unwritable",
+        }
     processed: List[str] = []
     errors: List[Dict[str, str]] = []
     if not pending.is_dir():

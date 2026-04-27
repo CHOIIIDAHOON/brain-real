@@ -92,8 +92,9 @@ class Settings:
             "yes",
             "on",
         }
-        self.hybrid_memory_pending_path = os.getenv("HYBRID_MEMORY_PENDING_PATH", "/data/logs/pending")
-        self.hybrid_memory_archive_path = os.getenv("HYBRID_MEMORY_ARCHIVE_PATH", "/data/logs/archive")
+        # 기본은 앱 CWD 기준(컨테이너에 /data 쓰기권이 없을 때 PermissionError 방지). 운영은 env로 오버라이드.
+        self.hybrid_memory_pending_path = os.getenv("HYBRID_MEMORY_PENDING_PATH", "./data/logs/pending")
+        self.hybrid_memory_archive_path = os.getenv("HYBRID_MEMORY_ARCHIVE_PATH", "./data/logs/archive")
         self.ollama_embed_model = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
         # 최종 응답이 사용할 모델(미지정이면 OLLAMA_MODEL과 동일)
         self.hybrid_memory_llm_model = os.getenv("HYBRID_MEMORY_LLM_MODEL", "").strip() or self.ollama_model
