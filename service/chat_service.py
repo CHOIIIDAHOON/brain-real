@@ -108,7 +108,7 @@ def ollama_request_error_fields(exception):
     return fields
 
 
-# 백그라운드 post-turn(인메모리 메모리 + 하이브리드 pending) 워커.
+# 백그라운드 post-turn(선택: 인메모리 저장 + Ollama 판단 + 하이브리드 pending·Chroma).
 def memory_worker_loop():
     while True:
         task = memory_task_queue.get()
@@ -119,18 +119,18 @@ def memory_worker_loop():
             model = str(task.get("model", ""))
             flow_id = str(task.get("flow_id", "")) or None
             decision = None
-            if settings.chat_memory_store_enabled:
+            if settings.chat_memory_store_enabled or settings.hybrid_memory_enabled:
                 cooldown_seconds = settings.chat_memory_session_cooldown_seconds
                 now = perf_counter()
-                skip_memory = False
+                skip_decision = False
                 if cooldown_seconds > 0:
                     with memory_schedule_lock:
                         last_time = session_last_memory_schedule_time.get(session_id)
                         if last_time is not None and (now - last_time) < cooldown_seconds:
-                            skip_memory = True
+                            skip_decision = True
                         else:
                             session_last_memory_schedule_time[session_id] = now
-                if not skip_memory:
+                if not skip_decision:
                     decision = maybe_store_global_memory(
                         session_id=session_id,
                         user_message=user_message,
@@ -413,9 +413,9 @@ def decide_memory_with_ollama(model, user_message, answer, session_id=None, flow
     return parsed_decision
 
 
-# 응답 완료 후 메모리 저장 파이프라인을 실행한다. 판단 결과 dict 또는 None(미실행/스킵)을 반환한다.
+# 응답 완료 후: Ollama 판단 + (하이브리드가 끄면) 인메모리 저장. 하이브리드만 쓰면 Chroma·pending이 주 저장소.
 def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=None):
-    if not settings.chat_memory_store_enabled:
+    if not settings.chat_memory_store_enabled and not settings.hybrid_memory_enabled:
         return None
     if settings.chat_memory_decision_mode.lower() != "ollama":
         write_chat_log(
@@ -466,23 +466,25 @@ def maybe_store_global_memory(session_id, user_message, answer, model, flow_id=N
         return decision
 
     content = decision["content"] or f"{user_message}\n{answer}"
-    if is_duplicate_memory(content, session_id=session_id, flow_id=flow_id):
-        write_chat_log(
-            "메모리_스킵",
-            {"session_id": session_id, "flow_id": flow_id, "reason": "duplicate"},
-        )
-        return decision
+    if settings.chat_memory_store_enabled and not settings.hybrid_memory_enabled:
+        if is_duplicate_memory(content, session_id=session_id, flow_id=flow_id):
+            write_chat_log(
+                "메모리_스킵",
+                {"session_id": session_id, "flow_id": flow_id, "reason": "duplicate"},
+            )
+            return decision
 
-    title = decision["title"] or user_message.strip().replace("\n", " ")[:50] or "chat_memory"
-    save_stored_memory(
-        title=title,
-        content=content,
-        tags=decision["tags"],
-        source="chat_auto",
-        session_id=session_id,
-        user_message=user_message,
-        flow_id=flow_id,
-    )
+    if settings.chat_memory_store_enabled and not settings.hybrid_memory_enabled:
+        title = decision["title"] or user_message.strip().replace("\n", " ")[:50] or "chat_memory"
+        save_stored_memory(
+            title=title,
+            content=content,
+            tags=decision["tags"],
+            source="chat_auto",
+            session_id=session_id,
+            user_message=user_message,
+            flow_id=flow_id,
+        )
     return decision
 
 
